@@ -122,12 +122,13 @@ UNETLoader (H3) ──▶ BSAIVedaSparsePatch ──▶ BasicGuider ──▶ Sa
 
 ### 结构 / Structure
 
-- **统一模型链**：`UNETLoader (minimax_h3_hybrid_fl2va_ref2va_b25-49-int8)` → `LoraLoader (官方 Turbo 4步 LoRA)` → `BSAIVedaSparsePatch (keep 5%, dual-fast, start 0.2)` → `BasicGuider` / `BasicScheduler (beta, 4步)` + `KSamplerSelect (euler)`。
+- **统一模型链**：`UNETLoader (minimax_h3_hybrid_fl2va_ref2va_b25-49-int8)` → `LoraLoaderModelOnly (官方 Turbo 4步 LoRA)` → `BSAIVedaSparsePatch (keep 5%, dual-fast, start 0.2)` → `BasicGuider` / `BasicScheduler (beta, 4步)` + `KSamplerSelect (euler)`。
+  > `BSAIVedaSparsePatch.enabled` 默认为 **false**（保留作音频/质量基线对比）；需要稀疏加速时在节点上打开 `enabled` 即可，参数已预置好。
 - **文生视频 / Text-to-Video**：图片输入区 LoadImage 设为 bypass（`mode: 4`）即纯文生。
 - **图生视频 / 参考生视频 / Image-to-Video & Reference-to-Video**：`easy ifElse` 开关（`PrimitiveBoolean`）切换：
-  - `false` → 图生视频（`MiniMaxH3ImageToVideo`，首尾帧渐变）；
-  - `true` → 参考生视频（`MiniMaxH3ReferenceToVideo`，参考图/参考视频 + 参考音频）。
-- 提示词走 `BSAI_H3_PromptTemplate`（需 [BSAI-MiniMAX-H3-Prompt](https://github.com/xm6018924) 插件）多模态融合模板。
+  - `true`（默认）→ 参考生视频（`MiniMaxH3ReferenceToVideo`，参考图/参考视频 + 参考音频）；
+  - `false` → 图生视频（`MiniMaxH3ImageToVideo`，首尾帧渐变）。
+- 提示词走 `BSAI_H3_PromptTemplate`（需 [BSAI-MiniMAX-H3-Prompt](https://github.com/xm6018924) 插件）多模态融合模板（默认"末日荒芜·野草丛生"）。
 - 输出：`CreateVideo (24fps + 音轨)` → `SaveVideo`。
 
 ### 所需模型 / Required Models

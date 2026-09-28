@@ -1,8 +1,8 @@
 {
   "id": "600fc867-03b7-4435-bf39-6a9c30ce6ffa",
   "revision": 0,
-  "last_node_id": 117,
-  "last_link_id": 134,
+  "last_node_id": 118,
+  "last_link_id": 139,
   "nodes": [
     {
       "id": 1,
@@ -25,7 +25,7 @@
           "type": "MODEL",
           "slot_index": 0,
           "links": [
-            1
+            138
           ]
         }
       ],
@@ -42,65 +42,6 @@
       "widgets_values_named": {
         "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
         "weight_dtype": "default"
-      },
-      "bgcolor": "rgba(0,0,0,0)"
-    },
-    {
-      "id": 2,
-      "type": "LoraLoader",
-      "pos": [
-        -15.97796778016242,
-        8.010429411656625
-      ],
-      "size": [
-        566.882115012795,
-        126
-      ],
-      "flags": {},
-      "order": 14,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 1
-        },
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 20
-        }
-      ],
-      "outputs": [
-        {
-          "name": "MODEL",
-          "type": "MODEL",
-          "slot_index": 0,
-          "links": [
-            2
-          ]
-        },
-        {
-          "name": "CLIP",
-          "type": "CLIP",
-          "links": null
-        }
-      ],
-      "title": "官方 Turbo 4步 LoRA（蒸馏步数匹配）",
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.37.0",
-        "Node name for S&R": "LoraLoader"
-      },
-      "widgets_values": [
-        "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
-        1,
-        1
-      ],
-      "widgets_values_named": {
-        "lora_name": "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
-        "strength_model": 1,
-        "strength_clip": 1
       },
       "bgcolor": "rgba(0,0,0,0)"
     },
@@ -122,7 +63,7 @@
         {
           "name": "model",
           "type": "MODEL",
-          "link": 2
+          "link": 139
         }
       ],
       "outputs": [
@@ -143,7 +84,7 @@
         "Node name for S&R": "BSAIVedaSparsePatch"
       },
       "widgets_values": [
-        true,
+        false,
         5,
         "dual-fast (2 groups)",
         "4,4,4;8,4,2;2,4,8;4,8,2",
@@ -158,7 +99,7 @@
         false
       ],
       "widgets_values_named": {
-        "enabled": true,
+        "enabled": false,
         "keep_percent": 5,
         "head_tiling": "dual-fast (2 groups)",
         "custom_tiling": "4,4,4;8,4,2;2,4,8;4,8,2",
@@ -195,7 +136,6 @@
           "type": "CLIP",
           "slot_index": 0,
           "links": [
-            20,
             125,
             126
           ]
@@ -294,11 +234,11 @@
         "Node name for S&R": "RandomNoise"
       },
       "widgets_values": [
-        673437332091170,
+        945967344952729,
         "randomize"
       ],
       "widgets_values_named": {
-        "noise_seed": 673437332091170,
+        "noise_seed": 945967344952729,
         "control_after_generate": "randomize"
       },
       "bgcolor": "rgba(0,0,0,0)"
@@ -652,7 +592,7 @@
       ],
       "size": [
         490,
-        578
+        916
       ],
       "flags": {},
       "order": 5,
@@ -761,13 +701,13 @@
         "Node name for S&R": "BSAI_H3_PromptTemplate"
       },
       "widgets_values": [
-        "多模态融合 > 末日荒芜·野草丛生 | Post-Apocalyptic Overgrowth > 末日荒芜·野草丛生（任意图渐变） | Post-Apocalyptic Overgrowth (Any image → wasteland)",
+        "画面特效与多视角 | VFX & Multi-View > 人物与空间关系特效 | Person-Space > 空间透视拉伸",
         "",
         "",
         ""
       ],
       "widgets_values_named": {
-        "template_select": "多模态融合 > 末日荒芜·野草丛生 | Post-Apocalyptic Overgrowth > 末日荒芜·野草丛生（任意图渐变） | Post-Apocalyptic Overgrowth (Any image → wasteland)",
+        "template_select": "画面特效与多视角 | VFX & Multi-View > 人物与空间关系特效 | Person-Space > 空间透视拉伸",
         "user_customization": "",
         "narration": "",
         "bsai_tpl_ui": ""
@@ -841,7 +781,7 @@
           ]
         }
       ],
-      "title": "4步 beta 调度（Turbo LoRA 配套）",
+      "title": "8步 beta 调度（音频基线）",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.37.0",
@@ -883,7 +823,7 @@
           ]
         }
       ],
-      "title": "euler 采样器",
+      "title": "euler（音频基线）",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.37.0",
@@ -901,8 +841,8 @@
       "id": 102,
       "type": "LoadImage",
       "pos": [
-        -1253.5837655276266,
-        48.42541119157099
+        -1257.0255563322685,
+        41.54182958228619
       ],
       "size": [
         407.0242831600808,
@@ -963,11 +903,11 @@
         "#sdppp_label": ""
       },
       "widgets_values": [
-        "ComfyUI_00061_ (1).png",
+        "ComfyUI_00001_.png",
         "image"
       ],
       "widgets_values_named": {
-        "image": "ComfyUI_00061_ (1).png",
+        "image": "ComfyUI_00001_.png",
         "upload": "image"
       },
       "bgcolor": "rgba(0,0,0,0)"
@@ -976,8 +916,8 @@
       "id": 103,
       "type": "LoadImage",
       "pos": [
-        -1243.4901449471076,
-        446.06293597416305
+        -1249.2264629548463,
+        428.8539819509507
       ],
       "size": [
         396.9981160995869,
@@ -1003,8 +943,8 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            108,
-            115
+            115,
+            135
           ]
         },
         {
@@ -1204,7 +1144,7 @@
       ],
       "size": [
         468.7990002630686,
-        484
+        424
       ],
       "flags": {},
       "order": 18,
@@ -1241,26 +1181,20 @@
           "name": "ref_images.ref_image_1",
           "shape": 7,
           "type": "IMAGE",
-          "link": 113
+          "link": 135
         },
         {
           "name": "ref_images.ref_image_2",
           "shape": 7,
           "type": "IMAGE",
-          "link": null
+          "link": 136
         },
         {
           "label": "ref_videos.ref_video_0",
           "name": "ref_videos.ref_video_0",
           "shape": 7,
           "type": "IMAGE",
-          "link": 108
-        },
-        {
-          "name": "ref_videos.ref_video_1",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 109
+          "link": null
         },
         {
           "label": "ref_video_audios.ref_video_audio_0",
@@ -1334,16 +1268,10 @@
           "link": null
         },
         {
-          "name": "ref_videos.ref_video_2",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": null
-        },
-        {
           "name": "ref_images.ref_image_3",
           "shape": 7,
           "type": "IMAGE",
-          "link": null
+          "link": 137
         },
         {
           "name": "ref_images.ref_image_4",
@@ -1607,12 +1535,12 @@
       },
       "widgets_values": [
         "16:9 (Widescreen)",
-        0.5,
+        1,
         32
       ],
       "widgets_values_named": {
         "aspect_ratio": "16:9 (Widescreen)",
-        "megapixels": 0.5,
+        "megapixels": 1,
         "multiple": 32
       },
       "bgcolor": "rgba(0,0,0,0)"
@@ -1621,8 +1549,8 @@
       "id": 113,
       "type": "LoadImage",
       "pos": [
-        -1241.5765295655942,
-        843.7004607567551
+        -1248.4601111748786,
+        826.3767103499753
       ],
       "size": [
         395.20093620787907,
@@ -1648,7 +1576,7 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            109
+            136
           ]
         },
         {
@@ -1874,10 +1802,10 @@
         }
       },
       "widgets_values": [
-        false
+        true
       ],
       "widgets_values_named": {
-        "value": false
+        "value": true
       },
       "bgcolor": "rgba(0,0,0,0)"
     },
@@ -1885,8 +1813,8 @@
       "id": 117,
       "type": "LoadImage",
       "pos": [
-        -1241.9045217591645,
-        1243.8640610109799
+        -1246.4935761653544,
+        1238.1276729798294
       ],
       "size": [
         395.20093620787907,
@@ -1912,7 +1840,7 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            113
+            137
           ]
         },
         {
@@ -1954,25 +1882,54 @@
         "upload": "image"
       },
       "bgcolor": "rgba(0,0,0,0)"
+    },
+    {
+      "id": 118,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        -39.61667236508196,
+        11.38720865678738
+      ],
+      "size": [
+        563.7792560030816,
+        82
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 138
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            139
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+        1
+      ],
+      "widgets_values_named": {
+        "lora_name": "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+        "strength_model": 1
+      },
+      "bgcolor": "rgba(0,0,0,0)"
     }
   ],
   "links": [
-    [
-      1,
-      1,
-      0,
-      2,
-      0,
-      "MODEL"
-    ],
-    [
-      2,
-      2,
-      0,
-      3,
-      0,
-      "MODEL"
-    ],
     [
       9,
       9,
@@ -2036,14 +1993,6 @@
       15,
       1,
       "AUDIO"
-    ],
-    [
-      20,
-      4,
-      0,
-      2,
-      1,
-      "CLIP"
     ],
     [
       30,
@@ -2222,6 +2171,14 @@
       "FLOAT"
     ],
     [
+      134,
+      22,
+      0,
+      111,
+      4,
+      "STRING"
+    ],
+    [
       125,
       4,
       0,
@@ -2254,35 +2211,35 @@
       "IMAGE"
     ],
     [
-      113,
-      117,
+      135,
+      103,
       0,
       110,
       4,
       "IMAGE"
     ],
     [
-      108,
-      103,
-      0,
-      110,
-      6,
-      "IMAGE"
-    ],
-    [
-      109,
+      136,
       113,
       0,
       110,
-      7,
+      5,
       "IMAGE"
+    ],
+    [
+      133,
+      22,
+      0,
+      110,
+      11,
+      "STRING"
     ],
     [
       110,
       112,
       0,
       110,
-      13,
+      12,
       "INT"
     ],
     [
@@ -2290,7 +2247,7 @@
       112,
       1,
       110,
-      14,
+      13,
       "INT"
     ],
     [
@@ -2298,24 +2255,32 @@
       106,
       1,
       110,
-      15,
+      14,
       "INT"
     ],
     [
-      133,
-      22,
+      137,
+      117,
       0,
       110,
-      12,
-      "STRING"
+      16,
+      "IMAGE"
     ],
     [
-      134,
-      22,
+      138,
+      1,
       0,
-      111,
-      4,
-      "STRING"
+      118,
+      0,
+      "MODEL"
+    ],
+    [
+      139,
+      118,
+      0,
+      3,
+      0,
+      "MODEL"
     ]
   ],
   "groups": [
@@ -2395,10 +2360,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.36966013547404925,
+      "scale": 0.6548754792605527,
       "offset": [
-        1830.7818155998812,
-        1026.478826391963
+        1460.6724970122866,
+        209.6435999350805
       ]
     },
     "qgn_navigation_groups": [],
