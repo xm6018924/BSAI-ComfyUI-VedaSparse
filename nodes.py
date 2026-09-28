@@ -35,15 +35,17 @@ from . import veda_engine as _ve
 # head-aware tiling 预设
 TILING_BALANCED = "balanced (4,4,4)"
 TILING_HEAD_AWARE = "head-aware (4 groups)"
+TILING_DUAL = "dual-fast (2 groups)"
 TILING_TEMPORAL = "temporal-first (8,4,2)"
 TILING_SPATIAL = "spatial-first (2,4,8)"
 TILING_EXTREME_SPATIAL = "extreme-spatial (1,8,8)"
 TILING_CUSTOM = "custom"
-TILING_PRESETS = (TILING_HEAD_AWARE, TILING_BALANCED, TILING_TEMPORAL,
+TILING_PRESETS = (TILING_DUAL, TILING_HEAD_AWARE, TILING_BALANCED, TILING_TEMPORAL,
                   TILING_SPATIAL, TILING_EXTREME_SPATIAL, TILING_CUSTOM)
 
 _PRESET_TILINGS = {
     TILING_BALANCED: ((4, 4, 4),),
+    TILING_DUAL: ((4, 4, 4), (8, 4, 2)),
     TILING_HEAD_AWARE: ((4, 4, 4), (8, 4, 2), (2, 4, 8), (4, 8, 2)),
     TILING_TEMPORAL: ((8, 4, 2),),
     TILING_SPATIAL: ((2, 4, 8),),
@@ -138,11 +140,11 @@ class BSAIVedaSparsePatch:
                 "label_off": "直通（不加速）",
                 "tooltip": "关闭时模型原样通过，不影响任何现有工作流。"}),
             "keep_percent": ("FLOAT", {
-                "default": 10.0, "min": 1.0, "max": 100.0, "step": 1.0,
+                "default": 5.0, "min": 1.0, "max": 100.0, "step": 1.0,
                 "tooltip": "每个 query tile 保留的关键 key tile 百分比。10 = 90% 稀疏"
                            "（视频实测配置）；8 步 V2 + TabLoRA 建议 10~20。"}),
             "head_tiling": (TILING_PRESETS, {
-                "default": TILING_HEAD_AWARE,
+                "default": TILING_DUAL,
                 "tooltip": "Head-Aware Tiling 预设。head-aware 按头循环分配 4 种"
                            "时空分块；balanced 全部头用 (4,4,4) 立方（≈VSA 几何 +"
                            "TripPool 评分）；temporal/spatial 强调时间或空间结构。"}),
@@ -171,7 +173,7 @@ class BSAIVedaSparsePatch:
                 "tooltip": "手动指定 video latent 尺寸 'T,H,W'（可选，一般留空）。"
                            "例如 30,24,42。留空=自动解析。"}),
             "start_percent": ("FLOAT", {
-                "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01,
+                "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
                 "tooltip": "去噪进度百分比起点；之前保持 dense 预热，保护初始结构。"}),
             "end_percent": ("FLOAT", {
                 "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,

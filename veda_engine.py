@@ -461,52 +461,54 @@ def _veda_sparse(qs, ks, vs, scale, keep_frac, video_start, video_end,
         sc = scores.reshape(B * Hd, nt, nt)
         topk_idx = sc.topk(topk, dim=-1).indices            # [BH, nt, topk]
 
-        # gather：每组头共享 tile 索引结构 -> 直接按整组 gather
-        hs_t = torch.tensor(heads, device=qs.device)
-        # 显存优化：只 gather 当前头 h 的 k/v 列（[B,nt,ts,D]），
-        # 避免原实现把全部 H 头复制（[B,nt,ts,H*D]）再取一列的 H× 浪费。
-        for h in heads:
-            # 当前头的索引（在 BH 大索引中的位置）
-            row = h * B
-            idx = topk_idx[row:row + B]                     # [B, nt, topk]
-            ts_ = qt.shape[2]
-            kth = kt[:, :, :, h, :]                         # [B, nt, ts, D]
-            vth = vt[:, :, :, h, :]
-            kthf = kth.reshape(B, nt, ts_ * D)
-            vthf = vth.reshape(B, nt, ts_ * D)
-            idx_flat = idx.reshape(B, nt * topk)
-            gkf = torch.gather(kthf, 1, idx_flat.unsqueeze(-1).expand(
-                B, nt * topk, ts_ * D))
-            gvf = torch.gather(vthf, 1, idx_flat.unsqueeze(-1).expand(
-                B, nt * topk, ts_ * D))
-            gk = gkf.reshape(B, nt, topk * ts_, D)
-            gv = gvf.reshape(B, nt, topk * ts_, D)
-            # key mask（tile 内 padding token 不参与 softmax；按 batch 高级索引收集）
-            kmf = km.reshape(nt, -1)                         # [nt, ts_]
-            gkm = kmf[idx_flat].reshape(B, nt, topk * ts_)   # [B, nt, topk*ts_]
+        # gather + sparse attention：行选择（连续 tile 拷贝）+ 分块。
+        # 每个 tile 的 64 token 连续存储 -> 按 (batch,head,tile) 行号高级索引，
+        # 一次拷贝整个 tile（连续读），索引读取量比 token 级 gather 小 ~4000x。
+        # 显存峰值由 CHUNK 控制（约 300MB），远小于原全头 gather 的 6.7GB。
+        Hg = len(heads)
+        ts_ = qt.shape[2]
+        idx_h = topk_idx.view(B, Hd, nt, topk)[:, heads, :, :].to(torch.int32)  # [B, Hg, nt, topk]
+        b_off = torch.arange(B, device=qs.device, dtype=torch.int32).view(B, 1, 1, 1) * (Hg * nt)
+        h_off = torch.arange(Hg, device=qs.device, dtype=torch.int32).view(1, Hg, 1, 1) * nt
+        kt2 = kt[:, :, :, heads, :].permute(0, 3, 1, 2, 4).reshape(B * Hg * nt, ts_ * D)
+        vt2 = vt[:, :, :, heads, :].permute(0, 3, 1, 2, 4).reshape(B * Hg * nt, ts_ * D)
+        qv2 = qt[:, :, :, heads, :].permute(0, 3, 1, 2, 4).reshape(B, Hg, nt, ts_, D)
+        if use_cond:
+            ck_h = ck[:, :, heads, :].permute(0, 2, 1, 3)              # [B, Hg, cond_end, D]
+            cv_h = cv[:, :, heads, :].permute(0, 2, 1, 3)
+
+        CHUNK = max(8, min(32, (256 * 1024 * 1024) // (Hg * topk * ts_ * D * 2)))
+        pieces = []
+        for i in range(0, nt, CHUNK):
+            j = min(i + CHUNK, nt)
+            nb = j - i
+            row_b = (b_off + h_off + idx_h[:, :, i:j]).reshape(-1)     # [B*Hg*nb*topk]
+            gk = kt2[row_b].view(B * Hg * nb, topk, ts_, D).reshape(B * Hg * nb, topk * ts_, D)
+            gv = vt2[row_b].view(B * Hg * nb, topk, ts_, D).reshape(B * Hg * nb, topk * ts_, D)
+            gkm = km[idx_h[:, :, i:j]].view(B * Hg * nb, topk * ts_)
+            q2 = qv2[:, :, i:j].reshape(B * Hg * nb, ts_, D)
             if use_cond:
-                k2 = torch.cat([ck[:, :, h, :].unsqueeze(1).expand(B, nt, cond_end, D),
-                                gk], dim=2)
-                v2 = torch.cat([cv[:, :, h, :].unsqueeze(1).expand(B, nt, cond_end, D),
-                                gv], dim=2)
+                ck_b = ck_h.unsqueeze(2).expand(B, Hg, nb, cond_end, D).reshape(
+                    B * Hg * nb, cond_end, D)
+                cv_b = cv_h.unsqueeze(2).expand(B, Hg, nb, cond_end, D).reshape(
+                    B * Hg * nb, cond_end, D)
+                k2 = torch.cat([ck_b, gk], dim=1)
+                v2 = torch.cat([cv_b, gv], dim=1)
                 key_mask = torch.cat(
-                    [torch.ones(B, nt, cond_end, dtype=torch.bool,
-                                device=qs.device), gkm], dim=2)
+                    [torch.ones(B * Hg * nb, cond_end, dtype=torch.bool,
+                                device=qs.device), gkm], dim=1)
             else:
                 k2, v2 = gk, gv
                 key_mask = gkm
-            # 稀疏注意力：query tile 内部 token 与选中 key 精确计算
-            qhh = qt[:, :, :, h, :]                          # [B, nt, ts, D]
-            khh = k2                                          # [B, nt, klen, D]（已只含 h 头）
-            vhh = v2
-            att = torch.matmul(qhh, khh.transpose(-2, -1)) * scale
-            att = att.masked_fill(
-                ~key_mask[:, :, None, :].expand(B, nt, att.shape[2], -1),
-                float("-inf"))
+            att = torch.bmm(q2, k2.transpose(-2, -1)) * scale
+            att = att.masked_fill(~key_mask[:, None, :].expand(-1, ts_, -1),
+                                  float("-inf"))
             att = att.softmax(dim=-1)
-            att = att.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)  # 全掩码行防护
-            oh = torch.matmul(att, vhh)                      # [B, nt, ts, D]
-            ov_parts[h] = oh
+            att = att.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)      # 全掩码行防护
+            pieces.append(torch.bmm(att, v2).reshape(B, Hg, nb, ts_, D))
+        ovg = torch.cat(pieces, dim=2)                                 # [B, Hg, nt, ts_, D]
+        for j, h in enumerate(heads):
+            ov_parts[h] = ovg[:, j]
 
     # --- 写回 video span（按 head 逐列） --------------------------------------
     # ov 形状 [B, vn, H, D]：需要把每头结果 un-tile 回原始 (t,h,w) 顺序
