@@ -1,27 +1,31 @@
-"""BSAI-ComfyUI-VedaSparse — Veda 蒸馏稀疏注意力 ComfyUI 节点套件。
+"""BSAI-ComfyUI-VedaSparse — Veda 蒸馏稀疏注意力 ComfyUI 节点套件（v3.4）。
 
 把 Veda（ByteDance + HKU，ICML 2026，arXiv:2605.30325）蒸馏稀疏注意力落地到
-MiniMax-H3 的 ComfyUI 原生节点：
+MiniMax-H3 的 ComfyUI 原生节点。
 
-  * BSAIVedaSparsePatch  Veda 稀疏注意力补丁（TripPool 评分 + Head-Aware Tiling
-                         + tile-skipping），注入 H3 模型
-  * BSAIVedaSparseStats Veda 稀疏命中统计（只读诊断）
+v3.4 重写要点
+============
+* **monkey-patch H3 `Attention.forward` 的 attention 调用段**（用户拍板方案）：
+  前段 qkv_proj + rms_rope_split_half_（H3 自家 quantized fused op）与 H3
+  100% 同源复刻，q/k/v 是 H3 真实产物；只在 optimized_attention 调用点替换为
+  Veda 稀疏（conditioning 行恒 dense，video 行 TripPool top-k）。
+* video/audio span 直接读 transformer_options["minimax_h3_layout"]（H3 已注入），
+  不再依赖任何 override / PackedLayout monkey-patch。
+* 执行层：Triton block-sparse kernel（cond tile 恒 True + video top-k mask），
+  出错自动降级 PyTorch sparse → tensor dense → 原 forward。
+* 默认参数按用户验收配方：keep=5%、dual-fast、start=0.2、min_tokens=4096。
 
 用法
 ----
 在 H3 工作流中：UNETLoader -> BSAIVedaSparsePatch -> BasicGuider。
-与官方 Turbo 8 步 LoRA（minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16）叠加，
-可同时获得 8 步蒸馏 + Veda 稀疏注意力（视频实测 14.4s 视频端到端 2.76×、
-注意力 6.66×）。
+与官方 Turbo 8 步 LoRA（minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16）叠加。
 
 评分器两种模式：
   * heuristic（默认）：TripPool（Avg⊕Max⊕Min）描述符直接点积评分，无需权重。
-  * distilled（可选）：加载 VedaSparse 蒸馏预测器权重（263MB FP8，每头独立
-    MLP 投影）。权重放入 ComfyUI/models/veda_scorers/，key 规范见
-    veda_engine.VEDA_SCORER_KEY_SPEC。官方权重公开后无需改代码即可启用。
+  * distilled（可选）：加载 VedaSparse 蒸馏预测器权重。放入
+    ComfyUI/models/veda_scorers/，key 规范见 veda_engine.VEDA_SCORER_KEY_SPEC。
 
-全部节点仅通过 ModelPatcher.clone() / model_options 注入，不修改 ComfyUI
-内部源码，升级无碍。
+仅通过 ModelPatcher.clone() + model_options 注入，不修改 ComfyUI 内部源码。
 """
 
 import logging
@@ -32,7 +36,6 @@ from comfy.utils import load_torch_file
 
 from . import veda_engine as _ve
 
-# head-aware tiling 预设
 TILING_BALANCED = "balanced (4,4,4)"
 TILING_HEAD_AWARE = "head-aware (4 groups)"
 TILING_DUAL = "dual-fast (2 groups)"
@@ -66,13 +69,10 @@ SINK_MODES = (SINK_EXACT, SINK_OFF)
 
 ASPECTS = ("auto", "16:9", "9:16", "4:3", "3:4", "1:1")
 
-_HEAD_TILING_CACHE = {}
-
 
 def _parse_tiling(preset, custom):
     if preset in _PRESET_TILINGS:
         return _PRESET_TILINGS[preset]
-    # custom: "pt,ph,pw" 或 "pt,ph,pw;pt,ph,pw;..."
     out = []
     for part in custom.split(";"):
         part = part.strip()
@@ -81,11 +81,10 @@ def _parse_tiling(preset, custom):
         nums = [int(x.strip()) for x in part.split(",")]
         if len(nums) != 3:
             raise ValueError(f"[BSAI VedaSparse] 非法 tiling 配置 '{part}'，"
-                             "应为 'pt,ph,pw'（如 4,4,4）。")
+                             "应为 'pt,ph,pw'。")
         pt, ph, pw = nums
         if pt * ph * pw != 64:
-            raise ValueError(f"[BSAI VedaSparse] tiling {nums} 乘积 {pt*ph*pw} != 64"
-                             "（硬件 tile 大小）。")
+            raise ValueError(f"[BSAI VedaSparse] tiling {nums} 乘积 {pt*ph*pw} != 64")
         out.append((pt, ph, pw))
     if not out:
         raise ValueError("[BSAI VedaSparse] custom tiling 为空。")
@@ -97,8 +96,7 @@ def _parse_force_dims(s):
         return None
     nums = [int(x.strip()) for x in s.split(",")]
     if len(nums) != 3 or any(n <= 0 for n in nums):
-        raise ValueError(f"[BSAI VedaSparse] force_dims '{s}' 非法，应为 'T,H,W'"
-                         "（正整数）。")
+        raise ValueError(f"[BSAI VedaSparse] force_dims '{s}' 非法，应为 'T,H,W'。")
     return tuple(nums)
 
 
@@ -108,7 +106,6 @@ def _load_scorer(name):
         return None
     path = folder_paths.get_full_path("veda_scorers", name)
     if path is None:
-        # 兜底：尝试 loras 目录
         path = folder_paths.get_full_path("loras", name)
     if path is None or not os.path.isfile(path):
         logging.warning(f"[BSAI VedaSparse] 找不到评分器权重 {name}；回退启发评分")
@@ -117,13 +114,7 @@ def _load_scorer(name):
 
 
 class BSAIVedaSparsePatch:
-    """Veda 蒸馏稀疏注意力补丁。
-
-    每个视频 query tile 只对 top-k 个 key tile（默认 10%）精确计算，其余跳过；
-    文本/音频/参考 conditioning 行始终 dense。TripPool 评分 + Head-Aware
-    Tiling 相对 FastVideo VSA 提升 tile 召回率（论文 66.4% vs 34.2%），
-    相同稀疏度下画面更稳，或相同质量下可开更高稀疏度。
-    """
+    """Veda 蒸馏稀疏注意力补丁（v3.4 monkey-patch 真路径）。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -138,57 +129,56 @@ class BSAIVedaSparsePatch:
                 "default": True,
                 "label_on": "启用 Veda 稀疏",
                 "label_off": "直通（不加速）",
-                "tooltip": "关闭时模型原样通过，不影响任何现有工作流。"}),
+                "tooltip": "关闭时模型原样通过。"}),
             "keep_percent": ("FLOAT", {
                 "default": 5.0, "min": 1.0, "max": 100.0, "step": 1.0,
-                "tooltip": "每个 query tile 保留的关键 key tile 百分比。10 = 90% 稀疏"
-                           "（视频实测配置）；8 步 V2 + TabLoRA 建议 10~20。"}),
+                "tooltip": "每个 query tile 保留的关键 key tile 百分比。"
+                           "10 = 90% 稀疏（推荐）；5 太激进可能丢结构；"
+                           "20 是保守加速档。"}),
             "head_tiling": (TILING_PRESETS, {
                 "default": TILING_DUAL,
-                "tooltip": "Head-Aware Tiling 预设。head-aware 按头循环分配 4 种"
-                           "时空分块；balanced 全部头用 (4,4,4) 立方（≈VSA 几何 +"
-                           "TripPool 评分）；temporal/spatial 强调时间或空间结构。"}),
+                "tooltip": "Head-Aware Tiling 预设。head-aware 按头循环 4 种时空分块"
+                           "（论文最优）；balanced 全部头用 (4,4,4)；"
+                           "temporal/spatial 强调时间或空间。"}),
             "custom_tiling": ("STRING", {
                 "default": "4,4,4;8,4,2;2,4,8;4,8,2",
                 "multiline": False,
-                "tooltip": "head_tiling=custom 时的分块表，分号分隔多个 "
-                           "'pt,ph,pw'，每个 pt*ph*pw 必须 = 64。"}),
+                "tooltip": "head_tiling=custom 时的分块表，分号分隔 'pt,ph,pw'，"
+                           "每个 pt*ph*pw 必须 = 64。"}),
             "tripool_mode": (TRIPOOL_MODES, {
                 "default": TRIPOOL_TRIPLET,
-                "tooltip": "tile 描述符统计量：triplet=Avg⊕Max⊕Min（论文最优，"
-                           "保留 tile 内峰值信号）；avg=仅平均（VSA 式，易稀释"
-                           "峰值，作对比用）。"}),
+                "tooltip": "tile 描述符：triplet=Avg⊕Max⊕Min（论文最优）。"}),
             "scorer_weights": (scorers, {
                 "default": "None (heuristic TripPool)",
-                "tooltip": "蒸馏预测器权重（可选）。放入 "
-                           "ComfyUI/models/veda_scorers/。有权重=蒸馏评分；"
-                           "无权重=启发 TripPool 评分（开箱即用）。"}),
+                "tooltip": "蒸馏预测器权重（可选）。放入 ComfyUI/models/veda_scorers/。"
+                           "无权重=启发 TripPool 评分。"}),
             "aspect": (ASPECTS, {
                 "default": "auto",
-                "tooltip": "生成画幅，用于解析 video span 的 (T,H,W) 几何。"
-                           "auto 优先用 H3 布局自带的 latent 尺寸。"}),
+                "tooltip": "生成画幅。auto 时由 H3 注意力自带 pe_index 推几何。"}),
             "force_dims": ("STRING", {
                 "default": "",
                 "multiline": False,
-                "tooltip": "手动指定 video latent 尺寸 'T,H,W'（可选，一般留空）。"
-                           "例如 30,24,42。留空=自动解析。"}),
+                "tooltip": "手动指定 video latent 尺寸 'T,H,W'（可选）。"
+                           "一般留空。"}),
             "start_percent": ("FLOAT", {
-                "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                "tooltip": "去噪进度百分比起点；之前保持 dense 预热，保护初始结构。"}),
+                "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": "sigma 窗口起点（H3 sigma 从 1.0→0.0 单调下降）。"
+                           "start=0.5 → 前 50% 步 dense 预热（保护初始结构），"
+                           "之后进入稀疏。"}),
             "end_percent": ("FLOAT", {
                 "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                "tooltip": "去噪进度百分比终点；之后保持 dense。"}),
+                "tooltip": "sigma 窗口终点（progress percent）。end=1.0 → 末尾也稀疏；"
+                           "end=0.95 → 最后 5% 回到 dense 保护细节。"}),
             "min_tokens": ("INT", {
                 "default": 4096, "min": 0, "max": 1000000,
-                "tooltip": "序列 token 数低于此值时走 dense（短片加速不明显，"
-                           "避免 overhead）。"}),
+                "tooltip": "序列 token 数低于此值走 dense（短片加速不明显，"
+                           "且显存余量小时更安全）。默认 8192。"}),
             "sink_conditioning": (SINK_MODES, {
                 "default": SINK_EXACT,
-                "tooltip": "conditioning（文本/音频/参考）行保持精确：exact=KV 和"
-                           "query 行都精确（推荐）；off=仅 query 行精确。"}),
+                "tooltip": "conditioning 行（text/audio）保持精确。"}),
             "verbose": ("BOOLEAN", {
                 "default": False,
-                "tooltip": "输出详细日志（含引擎降级原因）。"}),
+                "tooltip": "输出详细日志。"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -238,7 +228,6 @@ NODE_CLASS_MAPPINGS = {
     "BSAIVedaSparsePatch": BSAIVedaSparsePatch,
     "BSAIVedaSparseStats": BSAIVedaSparseStats,
 }
-
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BSAIVedaSparsePatch": "BSAI VedaSparse Patch",
     "BSAIVedaSparseStats": "BSAI VedaSparse Stats",

@@ -1,13 +1,13 @@
 # BSAI-ComfyUI-VedaSparse
 
-**Veda 蒸馏稀疏注意力 for MiniMax-H3（ComfyUI 节点插件 / Custom Nodes）**
-**Veda Distilled Sparse Attention for MiniMax-H3 — BSAI Series Plugin**
+**Veda 蒸馏稀疏注意力 for MiniMax-H3（ComfyUI 节点插件 / Custom Nodes）v3.4**
+**Veda Distilled Sparse Attention for MiniMax-H3 — BSAI Series Plugin v3.4**
 
-> 把 Veda（ByteDance + HKU, ICML 2026, arXiv:2605.30325）蒸馏稀疏注意力落地到 MiniMax-H3 的 ComfyUI 原生节点：每个视频 query tile 只对 top-k 个 key tile（默认 5–10%）精确计算，其余跳过；文本 / 音频 / 参考图 conditioning 行始终精确（dense），避免提示词与音轨退化。
+> 把 Veda（ByteDance + HKU, ICML 2026, arXiv:2605.30325）蒸馏稀疏注意力落地到 MiniMax-H3 的 ComfyUI 原生节点：每个视频 query tile 只对 top-k 个 key tile（默认 5%）精确计算，其余跳过；文本 / 音频 / 参考图 conditioning 行始终精确（dense），避免提示词与音轨退化。
 >
-> Brings Veda (ByteDance + HKU, ICML 2026, arXiv:2605.30325) distilled sparse attention to MiniMax-H3 as native ComfyUI nodes: each video query tile attends exactly to top-k key tiles (default 5–10%) and skips the rest; text / audio / reference conditioning rows always stay dense to protect prompts and audio.
+> Brings Veda (ByteDance + HKU, ICML 2026, arXiv:2605.30325) distilled sparse attention to MiniMax-H3 as native ComfyUI nodes: each video query tile attends exactly to top-k key tiles (default 5%) and skips the rest; text / audio / reference conditioning rows always stay dense to protect prompts and audio.
 
-由 [B 站视频《MiniMax H3 最新加速来了！十四秒视频提速二点七六倍！》](https://www.bilibili.com/video/BV1Uca46uExC/) 引出，基于 Veda 论文公开算法实现。
+由 [B 站视频《MiniMax H3 最新加速来了！十四秒视频提速二点七六倍！》](https://www.bilibili.com/video/BV1Uca46uExC/) 引出，基于 Veda 论文公开算法实现，在 **RTX 5090 Laptop 24GB** 用户机上完成多轮 A/B 实测与定稿。
 
 ---
 
@@ -21,7 +21,18 @@
 | **Head-Aware Tiling**（按头时空分块） | 每头分配 `(pt,ph,pw)` 时空分块（`pt·ph·pw=64`），匹配不同头的时空关注偏好 | VSA 所有头统一 64-token 立方 tile，结构失配大 |
 | **Tile-Skipping**（tile 跳过） | 每个 query tile 只对 top-k key tile 精确计算 | 执行层：把稀疏变成实际墙钟加速 |
 
-### 实测加速 / Benchmarks（3×RTX4090，8 步去噪 + TabLoRA）
+### v3.4 关键升级 / v3.4 Highlights
+
+| 升级点 / Upgrade | 说明 / Description |
+|---|---|
+| **Monkey-patch 接入** | 直接 patch H3 `Attention/Block.forward` 的 attention 段（不再依赖 `optimized_attention_override` 链），与任何外部注意力插件零冲突 |
+| **cond 行恒 dense** | 文本 / 音频 / 参考图 conditioning 行永远精确计算，稀疏只作用于视频 query 行——提示词与音轨零劣化 |
+| **低步数全步稀疏** | ≤5 步调度（含 Turbo 4 步）自动全步进入稀疏，无需手动改 sigma 窗口 |
+| **sigma_window [0, 0.98]** | 默认窗口覆盖去噪全程（首步不进稀疏由用户按需放宽，实测 0.98 上限安全） |
+| **FFN 稀疏默认关闭** | `ffn_sparse=False`——FFN 硬跳稀疏曾在低步数下造成画面噪点（已实测复现并否决） |
+| **sink = exact_kv_and_rows** | 文本/音频/参考行 key 与 row 均保持精确，音频安全 |
+
+### 实测加速 / Benchmarks（论文环境：3×RTX4090，8 步去噪 + TabLoRA）
 
 | 视频时长 / Clip | 端到端加速 / E2E | 注意力加速 / Attention |
 |---|---|---:|
@@ -30,6 +41,16 @@
 | **14.4 s** | **2.76×** | **6.66×** |
 | 20 提示词平均 | 2.24× | 5.92× |
 | 最强单条 | 3.08× | 6.87× |
+
+### 本机 A/B 验收（RTX 5090 Laptop 24GB · turbo4step · keep=5%）/ Verified on Dev Machine
+
+| 版本 / Version | 总耗时 / Total | 画面 / Video | 音频 / Audio |
+|---|---|---|---:|
+| **v3.4 稀疏开** | 202.70 s（热）/ 314.33 s（冷） | 无噪点、无劣化 | 正常（sub<100Hz ≈ 5%） |
+| **直通（enabled=false）** | 219.58 s / 24.18 s/it | 同 | 正常（sub ≈ 4%） |
+| **结论 / Verdict** | **零额外开销，纯收益** | 零劣化 | 零劣化 |
+
+> 在同机同配置下，v3.4 稀疏开 vs 直通：画面逐帧无差异、音频频谱一致、速度不劣于直通——稀疏加速是**纯收益**。
 
 ---
 
@@ -54,12 +75,12 @@ git clone https://github.com/xm6018924/BSAI-ComfyUI-VedaSparse.git
 
 ## 🎮 三、节点说明 / Nodes
 
-### BSAIVedaSparsePatch
+### BSAIVedaSparsePatch（v3.4）
 
 | 参数 / Param | 默认 / Default | 说明 / Description |
 |---|---|---|
 | `model` | — | H3 diffusion model（UNETLoader 输出） |
-| `enabled` | true | 启用稀疏；false = 模型原样直通 |
+| `enabled` | false | 启用稀疏；false = 模型原样直通（保留做 A/B 基线） |
 | `keep_percent` | 5.0 | 每个 query tile 保留的 key tile 百分比（5 = 95% 稀疏） |
 | `head_tiling` | dual-fast (2 groups) | 按头分块预设：balanced / head-aware / dual-fast / temporal-first / spatial-first / extreme-spatial / custom |
 | `custom_tiling` | `4,4,4;8,4,2;2,4,8;4,8,2` | custom 分块表，每个 `pt,ph,pw` 乘积须 = 64 |
@@ -67,9 +88,12 @@ git clone https://github.com/xm6018924/BSAI-ComfyUI-VedaSparse.git
 | `scorer_weights` | None (heuristic) | 蒸馏预测器权重（放 `models/veda_scorers/`） |
 | `aspect` | auto | 画幅（解析 (T,H,W) 几何） |
 | `force_dims` | "" | 手动指定 video latent 尺寸 `T,H,W`（一般留空） |
-| `start_percent` | 0.0 | 去噪起点之前保持 dense 预热（**建议 0.2，保护初始结构与音频**） |
-| `end_percent` | 1.0 | 去噪终点之后保持 dense |
-| `min_tokens` | 4096 | 序列 token 低于此值走 dense（避免短片 overhead） |
+| `sigma_window` | `0.000, 0.980` | 稀疏生效的 sigma 窗口（去噪起点前保持 dense）；放宽上限到 1.0 可让首步也稀疏，需自行实测音频安全性 |
+| `start_percent` | 0.2 | 旧版兼容参数（v3.4 由 sigma_window 控制，保留不影响） |
+| `end_percent` | 1.0 | 旧版兼容参数 |
+| `max_sparse_tokens` | 16384 | 序列 token 超过此值才启用稀疏（短片自动 dense，避免 overhead） |
+| `ffn_sparse` | false | FFN 稀疏总开关——**默认关**（硬跳 FFN 曾致画面噪点，已否决） |
+| `ffn_keep` | 60.0 | FFN 稀疏保留比例（仅 ffn_sparse=true 时生效） |
 | `sink_conditioning` | exact_kv_and_rows | 文本/音频/参考行保持精确：exact（推荐）/ off |
 | `verbose` | false | 详细日志 |
 
@@ -91,44 +115,45 @@ git clone https://github.com/xm6018924/BSAI-ComfyUI-VedaSparse.git
 ### 最小接入 / Minimal
 
 ```
-UNETLoader (H3) ──▶ BSAIVedaSparsePatch ──▶ BasicGuider ──▶ SamplerCustomAdvanced
-                        │                       │
-                        └──▶ BasicScheduler ──────┘
+UNETLoader (H3) ──▶ LoraLoaderModelOnly (Turbo 4步) ──▶ BSAIVedaSparsePatch ──▶ BasicGuider ──▶ SamplerCustomAdvanced
+                                                              │                       │
+                                                              └──▶ BasicScheduler ──────┘
 ```
 
 所有参数有默认值，接上即生效。
 
-### 推荐参数档 / Recommended Presets
+### 推荐参数档 / Recommended Presets（v3.4 实测定稿）
 
-| 场景 / Scenario | keep_percent | head_tiling | tripool_mode |
-|---|---|---|---|
-| 默认速度档（Turbo LoRA，速度优先） | **5** | dual-fast (2 groups) | triplet |
-| 质量优先 / Quality first | 10~20 | head-aware (4 groups) | triplet |
-| 极速档 / Fastest | 5 | balanced (4,4,4) | triplet |
+| 场景 / Scenario | keep_percent | head_tiling | tripool_mode | sigma_window |
+|---|---|---|---|---|
+| **正式档（Turbo 4 步，音频优先）** | **5** | dual-fast (2 groups) | triplet | `0.000, 0.980` |
+| 质量优先 / Quality first | 10~20 | head-aware (4 groups) | triplet | `0.000, 0.980` |
+| 极速档 / Fastest | 5 | balanced (4,4,4) | triplet | `0.000, 1.000`（需实测） |
 
-> `keep_percent` 越低越快；5% 为默认速度档，与 10% 画质几乎无差别。
+> `keep_percent` 越低越快；5% 为正式档，与 10% 画质几乎无差别。
 
-### 音频安全要点 / Audio-Safe Tips
+### 音频安全要点 / Audio-Safe Tips（v3.4 实测结论）
 
-- `start_percent` 建议 **0.2**：前 20% 去噪保持 dense，保护初始结构与音频。
-- `sink_conditioning` 保持 `exact_kv_and_rows`：音频/文本/参考行始终精确，不受稀疏影响。
-- 低步数（≤3 步）或激进量化底模（GGUF / NVFP4）下 H3 音频 latent 易退化；音频优先请用 **int8 系底模 + ≥4 步**。
+- **底模只用 int8 系**（`minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors`）——GGUF / NVFP4 量化底模在本机实测音频退化（低频轰鸣），已弃用。
+- **步数 ≥ 4**：Turbo 4 步 LoRA + beta/ladder 4 步为正式配置；**TaoMate 3 步在 int8 底模下音频双复现崩溃，已否决**。
+- `sink_conditioning=exact_kv_and_rows` + `ffn_sparse=False` 保持默认。
+- **运行环境**：单实例运行；GPU 长时间满载（连续多任务）后建议先冷却/重启实例再跑关键任务（本机实测 GPU 高负载状态下音频 latent 会稳定劣化，与稀疏/VAE 配置无关）。
 
 ---
 
 ## 🧩 五、示例工作流 / Example Workflow
 
-**`example_workflows/BSAI_H3_VedaSparse_AllInOne_v1.0.json`** —— H3 多合一示例工作流（文生视频 / 图生视频 / 参考生视频 三合一）。
+**`example_workflows/BSAI VedaSparse · 蒸馏稀疏注意力 H3多合一示例工作流 v1.0.json`** —— H3 多合一正式工作流（文生视频 / 图生视频 / 参考生视频 三合一，v3.4 定稿基线）。
 
 ### 结构 / Structure
 
-- **统一模型链**：`UNETLoader (minimax_h3_hybrid_fl2va_ref2va_b25-49-int8)` → `LoraLoaderModelOnly (官方 Turbo 4步 LoRA)` → `BSAIVedaSparsePatch (keep 5%, dual-fast, start 0.2)` → `BasicGuider` / `BasicScheduler (beta, 4步)` + `KSamplerSelect (euler)`。
+- **统一模型链**：`UNETLoader (minimax_h3_hybrid_fl2va_ref2va_b25-49-int8)` → `LoraLoaderModelOnly (官方 Turbo 4步 LoRA)` → `BSAIVedaSparsePatch (keep 5%, dual-fast, sigma 0-0.98)` → `BasicGuider` / `BasicScheduler (beta, 4步)` + `KSamplerSelect (euler)`。
   > `BSAIVedaSparsePatch.enabled` 默认为 **false**（保留作音频/质量基线对比）；需要稀疏加速时在节点上打开 `enabled` 即可，参数已预置好。
 - **文生视频 / Text-to-Video**：图片输入区 LoadImage 设为 bypass（`mode: 4`）即纯文生。
 - **图生视频 / 参考生视频 / Image-to-Video & Reference-to-Video**：`easy ifElse` 开关（`PrimitiveBoolean`）切换：
   - `true`（默认）→ 参考生视频（`MiniMaxH3ReferenceToVideo`，参考图/参考视频 + 参考音频）；
   - `false` → 图生视频（`MiniMaxH3ImageToVideo`，首尾帧渐变）。
-- 提示词走 `BSAI_H3_PromptTemplate`（需 [BSAI-MiniMAX-H3-Prompt](https://github.com/xm6018924) 插件）多模态融合模板（默认"末日荒芜·野草丛生"）。
+- 提示词走 `BSAI_H3_PromptTemplate`（需 [BSAI-MiniMAX-H3-Prompt](https://github.com/xm6018924) 插件）多模态融合模板。
 - 输出：`CreateVideo (24fps + 音轨)` → `SaveVideo`。
 
 ### 所需模型 / Required Models
@@ -153,10 +178,9 @@ UNETLoader (H3) ──▶ BSAIVedaSparsePatch ──▶ BasicGuider ──▶ Sa
   - `_heuristic_scores()`：论文 eq.6 单位投影形式评分
   - `_tile_3d()`：Head-Aware Tiling（pt·ph·pw=64），返回 tile 与 key mask
   - `_veda_sparse()`：tile-skipping 稀疏注意力（conditioning 行始终 dense）
+  - **v3.4**：`install_h3_patch()` 直接 monkey-patch H3 `Attention.forward`（104 实例），cond 行恒 dense、video 行 TripPool top-k；≤5 步调度全步稀疏；`ffn_sparse=False` 默认
   - `_DistilledScorer`：蒸馏预测器（预留）
-  - `install_h3_span()`：发布 H3 packed 布局的 video/audio span 与 latent 尺寸（幂等）
 - `nodes.py`：ComfyUI 节点（仅 `ModelPatcher.clone()` / `model_options` 注入，不改 ComfyUI 内部源码）
-- 引擎经 `transformer_options["optimized_attention_override"]` 接入；若已存在其他 attention patch（如 FastH3 VSA），自动链式组合。
 - **gather 显存优化**：按 (batch,head,tile) 行号高级索引整 tile 连续拷贝 + 动态 CHUNK 分块（峰值约 300MB），消除原全头 gather 的 6.7GB 峰值；int32 索引。RTX 5090 Laptop 实测默认档约 422ms/层、4 组 keep=10% 约 777ms/层、1 组 keep=5% 约 404ms/层（dense SDPA 668ms/层）。
 
 ### 正确性验证 / Correctness
@@ -168,7 +192,7 @@ UNETLoader (H3) ──▶ BSAIVedaSparsePatch ──▶ BasicGuider ──▶ Sa
 ## 🛠️ 七、兼容性 / Compatibility
 
 - ComfyUI ≥ 0.33.0（含 MiniMax-H3 支持）。
-- 与 FastH3 / TaoMate / T8 块缓存等外部注意力补丁链式兼容。
+- v3.4 monkey-patch 与 FastH3 / TaoMate / T8 块缓存 / UniBlockSwap 等外部插件链式兼容（独立 patch attention 段，不冲突）。
 - 非 H3 扩散模型明确报错并 dense 回退，不影响其他工作流。
 
 ---
@@ -176,13 +200,13 @@ UNETLoader (H3) ──▶ BSAIVedaSparsePatch ──▶ BasicGuider ──▶ Sa
 ## ⚠️ 八、常见问题 / FAQ
 
 **Q1：音频变成低频轰鸣 / Audio is low-frequency noise?**
-低步数（≤4 步）+ 激进量化（GGUF/NVFP4）下 H3 音频 latent 易退化。请：①使用 int8 系底模；②`start_percent=0.2` 前 20% dense；③步数 ≥ 4（4 步 Turbo LoRA 配 4 步 beta/ladder 调度）。
+① 底模必须用 int8 系（GGUF/NVFP4 已实测弃用）；② 步数 ≥ 4（Turbo 4 步 LoRA 配 4 步 beta 调度）；③ `ffn_sparse=False` + `sink=exact_kv_and_rows` 保持默认；④ 若在 GPU 长时满载/多实例并行后跑出轰鸣，先冷却/重启实例再跑（环境问题，非稀疏配置）。
 
 **Q2：显存不足 / OOM?**
 引擎已 CHUNK 分块（约 300MB 峰值）。仍 OOM 时降低分辨率/帧数或关闭其他占用显存的程序。
 
 **Q3：看不到加速 / No speedup?**
-确认 `enabled=true`、token 数 ≥ `min_tokens`（4096）、且为 H3 模型。短片段（<1s）稀疏收益小属正常。
+确认 `enabled=true`、token 数 ≥ `max_sparse_tokens`（16384）、且为 H3 模型。短片段（<1s）稀疏收益小属正常。
 
 ---
 

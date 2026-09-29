@@ -1,90 +1,404 @@
-"""BSAI VedaSparse — Veda 蒸馏稀疏注意力引擎 for MiniMax-H3.
+"""BSAI VedaSparse — Veda 蒸馏稀疏注意力引擎 for MiniMax-H3（v3.4 monkey-patch 真路径）。
 
-What it is
-----------
-VedaSparse 是 Veda（ByteDance + HKU，ICML 2026，arXiv:2605.30325）蒸馏稀疏注意力
-在 MiniMax-H3 上的落地实现。相比 FastVideo VSA（固定 64-token 立方 tile + 平均池化
-评分），Veda 有两个关键升级（论文实测 tile 召回率 66.4% vs 34.2%）：
+v3.4 = 直接替换 H3 attention.forward 的 attention 调用段（真加速唯一可行路径）
+================================================================================
 
-  1. Statistics-Aware Tile Scoring（统计感知 tile 评分）
-     VSA 用平均池化压缩 tile，会稀释峰值信号；Veda 用 TripPool 描述符
-     （Avg ⊕ Max ⊕ Min 三统计量拼接）保留 tile 内峰值，评分更贴近全注意力。
-     论文 Table 2：Triplet 0.912 < Avg 0.965 < MaxMin 0.982（训练损失越低越好）。
+v3.0~v3.3 失败根因（已定位）
+---------------------------
+* v3.0/v3.1 走 optimized_attention_override 注入：H3 attention.forward（model.py:200）
+  **裸调原生 optimized_attention**，且 H3 传了 preferred_attention=self.comfy_attention
+  （int8 底模 = comfy_kitchen_int8 attention）。override 链在 H3 上不可靠，
+  "sparse called" 日志实际来自其它插件的 attention，H3 从未真正稀疏。
+* v3.3 spy hook 试图复刻 qkv_proj + RMSNorm + RoPE：H3 用 quantized fused op
+  （comfy.quant_ops.ck.rms_rope_split_half_），复刻与 H3 实际数值不同，
+  误差累积 64 层 × N 步 → 废片。
 
-  2. Head-Aware Tiling（按头时空分块）
-     不同注意力头关注不同的时空结构（局部空间 vs 长程时间），Veda 为每个头
-     分配 (pt, ph, pw) 时空分块配置（pt·ph·pw = 硬件 tile 大小 64），减少
-     结构与全注意力失配（论文 Fig.6：不同头不同 tiling 召回率差异巨大）。
+v3.4 方案（本文件）
+-------------------
+1. monkey-patch H3 `comfy.ldm.minimax.model.Attention.forward`（实例级）：
+   新 forward **逐行复刻 H3 原 forward 前段**（qkv_proj → split → v.view →
+   rms_rope_split_half_ / q_norm·k_norm → AttentionTensorContainer 包装），
+   q/k/v 与 H3 数值 **100% 一致**（就是同一段代码，冒烟实测 0.00e+00）。
+2. 只在 `optimized_attention(...)` 调用点替换为 Veda 稀疏注意力：
+   * conditioning 行（text/refs/audio）作为 key **恒 dense**（音频安全线）；
+   * video 行做 TripPool top-k（含自身 tile）；video query 与 cond/video key
+     走 **联合 softmax**（logsumexp 恒等，数学精确）。
+3. video/audio span 直接读 H3 已注入的 `transformer_options["minimax_h3_layout"]`
+   （model.py:624），不需要任何 PackedLayout monkey-patch。
+4. 执行层：Triton block-sparse kernel **按 selected-index 列表**循环
+   （每 query tile 只迭代其 top-k+cond 的 key tile，不是全序列）；
+   出错自动降级 → 纯 PyTorch sparse（带 sink）→ tensor dense → 原 forward。
+5. 输出 reshape 为 H3 期待的 [B, L, H*D]，走 self.out_proj，与 H3 完全一致。
 
-  3. Tile-Skipping Sparse Attention（tile 跳过稀疏注意力）
-     每个 query tile 只对 top-k 个 key tile 精确计算（默认 10%），其余跳过；
-     文本/音频/参考 conditioning 行始终保持 dense（精确），避免提示词和
-     音轨退化。这是 ComfyUI 里把理论稀疏变成实际墙钟加速的执行层。
-
-Scorer modes（评分器两种模式）
-------------------------------
-  * heuristic（默认，无需任何权重）：φ = identity，用 TripPool 描述符直接点积
-    评分，公式即论文 eq.6 在单位投影下的形式。开箱即用。
-  * distilled（预留）：加载 VedaSparse 蒸馏预测器权重（263MB FP8，每头独立
-    MLP 投影 φ_q/φ_k），key 规范见 ``VEDA_SCORER_KEY_SPEC``。权重文件放入
-    ComfyUI/models/veda_scorers/。当官方权重公开后，无需改代码即可启用蒸馏评分。
-
-Usage（与 FastH3 同 seam）
---------------------------
-通过 transformer_options["optimized_attention_override"] 注入，ComfyUI 的
-H3 注意力会回调本引擎。只打 ModelPatcher.clone() + model_options，不改
-ComfyUI 内部源码，升级无碍。
-
-Reference
----------
-Veda: Scalable Video Diffusion via Distilled Sparse Attention
-Shihao Han, Hao Yang, Xiaofeng Mei, Xinting Hu, Yi Jiang, Xiaojuan Qi
-ICML 2026 · arXiv:2605.30325
+硬件/依赖：Triton 3.5+（SM 80+）；无 Triton 自动 PyTorch 路径。
 """
 
 import logging
-import math
-import sys
-from functools import partial
+import types
 
 import torch
 import torch.nn.functional as F
 
-BLOCK = 64                       # H3 tile size (与 FastVideo VSA / ComfyUI 一致)
-_HEAD_TILING_FACTORIZATIONS = (  # (pt, ph, pw) 且 pt*ph*pw = 64 的候选集合
-    (4, 4, 4),   # 均匀立方（VSA 默认，时空均衡）
-    (8, 4, 2),   # 时间主导
-    (2, 4, 8),   # 空间主导
-    (4, 8, 2),   # 时间-高度主导
-    (2, 8, 4),   # 高度主导
-    (8, 2, 4),   # 时间-宽度主导
-    (4, 2, 8),   # 宽度主导
-    (1, 8, 8),   # 纯空间
-    (8, 8, 1),   # 纯时间
-    (1, 4, 16),  # 极细空间
-    (16, 4, 1),  # 极细时间
-    (1, 2, 32),  # 超宽空间
-    (32, 2, 1),  # 超长时间
-)
-# 默认按头循环分配的分组（论文 Fig.6 显示不同头需要不同 tiling；组内头共享
-# tile 结构以控制 gather 开销，评分仍逐头计算）。组数=4 是加速/质量的平衡点。
-_DEFAULT_HEAD_TILING_GROUPS = ((4, 4, 4), (8, 4, 2), (2, 4, 8), (4, 8, 2))
+BLOCK = 64
 
+# 全局开关与统计
 _STATS = {"sparse": 0, "dense": 0, "heuristic": 0, "distilled": 0,
           "errors": 0, "fallback_1d": 0}
 _SEEN = set()
-_SPAN_INSTALLED = set()
-_PATCHED_LAYOUTS = set()
-_SPANS = {}                    # id(position_ids) -> (layout, video_span, audio_span, latent_dims)
+_FALLBACK_TO_DENSE = False                  # OOM 触发后整进程 dense
 
-# VedaSparse 蒸馏预测器权重 key 规范（预留；官方权重发布后按此加载）
-#   vedascorer.layer_{l}.head_{h}.q_proj   [in=3*d_head, out=d_latent]
-#   vedascorer.layer_{l}.head_{h}.k_proj   [in=3*d_head, out=d_latent]
-VEDA_SCORER_KEY_SPEC = "vedascorer.layer_{l}.head_{h}.{qk}_proj"
+_TRITON_SPARSE_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_SPARSE_AVAILABLE = True
+except ImportError:
+    logging.info("[BSAI VedaSparse v3.4] triton not available -> PyTorch path")
+
+_ENABLE_TRITON = True
 
 
 # ---------------------------------------------------------------------------
-# H3 packed-layout span 发布（独立实现，与 FastH3 思路一致但不互相依赖）
+# Triton block-sparse attention kernel（selected-index 循环）
+# ---------------------------------------------------------------------------
+
+if _TRITON_SPARSE_AVAILABLE:
+
+    @triton.jit
+    def _sparse_attn_fwd(
+        Q, K, V, Out, SelIdx, SelCnt,
+        sm_scale,
+        stride_qb, stride_qh, stride_qm, stride_qd,
+        stride_kb, stride_kh, stride_kn, stride_kd,
+        stride_vb, stride_vh, stride_vn, stride_vd,
+        stride_ob, stride_oh, stride_om, stride_od,
+        N_CTX: tl.constexpr,
+        N_TILE_K: tl.constexpr,
+        MAX_SEL: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+    ):
+        """FlashAttn 风格 block-sparse forward（selected-index）。
+
+        SelCnt[start_m] = 该 query tile 选中的 key tile 数；
+          * < 0：哨兵，该行走全序列 dense（cond/混合 query tile）。
+          * >= 0：该行只循环 SelIdx[start_m, :cnt] 中的 key tile。
+        SelIdx: [n_tile_q, MAX_SEL] int32。
+        """
+        start_m = tl.program_id(0)
+        off_b = tl.program_id(1)
+        off_h = tl.program_id(2)
+
+        q_offset = off_b * stride_qb + off_h * stride_qh
+        k_offset = off_b * stride_kb + off_h * stride_kh
+        v_offset = off_b * stride_vb + off_h * stride_vh
+        o_offset = off_b * stride_ob + off_h * stride_oh
+
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, HEAD_DIM)
+
+        q_ptrs = Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+        m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+        cnt = tl.load(SelCnt + start_m)
+
+        if cnt < 0:
+            for start_n in range(0, N_TILE_K):
+                offs_kn = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+                k_ptrs = K + k_offset + offs_kn[:, None] * stride_kn + offs_d[None, :] * stride_kd
+                v_ptrs = V + v_offset + offs_kn[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                k = tl.load(k_ptrs, mask=offs_kn[:, None] < N_CTX, other=0.0)
+                v = tl.load(v_ptrs, mask=offs_kn[:, None] < N_CTX, other=0.0)
+                qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
+                qk = qk * sm_scale
+                qk = tl.where(offs_kn[None, :] < N_CTX, qk, -float("inf"))
+                m_ij = tl.maximum(m_i, tl.max(qk, 1))
+                alpha = tl.math.exp2((m_i - m_ij) * 1.4426950408889634)
+                pp = tl.math.exp2((qk - m_ij[:, None]) * 1.4426950408889634)
+                pp = tl.where(pp == pp, pp, 0.0)
+                alpha = tl.where(alpha == alpha, alpha, 0.0)
+                l_i = l_i * alpha + tl.sum(pp, 1)
+                acc = acc * alpha[:, None]
+                acc = tl.dot(pp.to(v.dtype), v, acc, out_dtype=tl.float32)
+                m_i = m_ij
+        else:
+            for s in range(0, MAX_SEL):
+                if s < cnt:
+                    start_n = tl.load(SelIdx + start_m * MAX_SEL + s)
+                    offs_kn = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+                    k_ptrs = K + k_offset + offs_kn[:, None] * stride_kn + offs_d[None, :] * stride_kd
+                    v_ptrs = V + v_offset + offs_kn[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                    k = tl.load(k_ptrs, mask=offs_kn[:, None] < N_CTX, other=0.0)
+                    v = tl.load(v_ptrs, mask=offs_kn[:, None] < N_CTX, other=0.0)
+                    qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
+                    qk = qk * sm_scale
+                    qk = tl.where(offs_kn[None, :] < N_CTX, qk, -float("inf"))
+                    m_ij = tl.maximum(m_i, tl.max(qk, 1))
+                    alpha = tl.math.exp2((m_i - m_ij) * 1.4426950408889634)
+                    pp = tl.math.exp2((qk - m_ij[:, None]) * 1.4426950408889634)
+                    pp = tl.where(pp == pp, pp, 0.0)
+                    alpha = tl.where(alpha == alpha, alpha, 0.0)
+                    l_i = l_i * alpha + tl.sum(pp, 1)
+                    acc = acc * alpha[:, None]
+                    acc = tl.dot(pp.to(v.dtype), v, acc, out_dtype=tl.float32)
+                    m_i = m_ij
+
+        acc = tl.where(l_i[:, None] > 0, acc / l_i[:, None], 0.0)
+        o_ptrs = Out + o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
+
+
+def _triton_sparse_attention(q, k, v, sel_idx, sel_cnt):
+    """执行 Triton block-sparse attention（selected-index）。
+
+    q/k/v: [B, H, N, D]；sel_idx: [n_tile_q, MAX_SEL] int32；
+    sel_cnt: [n_tile_q] int32（<0 = dense 行）。
+    返回 [B, H, N, D]。
+    """
+    B, H, N, D = q.shape
+    out = torch.empty_like(q)
+    sm_scale = 1.0 / (D ** 0.5)
+    n_tile = (N + BLOCK - 1) // BLOCK
+    max_sel = sel_idx.shape[1]
+    grid = (n_tile, B, H)
+    _sparse_attn_fwd[grid](
+        q, k, v, out, sel_idx, sel_cnt, sm_scale,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        N_CTX=N, N_TILE_K=n_tile,
+        MAX_SEL=max_sel, BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=D,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# TripPool 评分（Veda 论文 eq.5/eq.6）
+# ---------------------------------------------------------------------------
+
+def _tripool(tiles, mode="triplet"):
+    """tiles: [B, H, nq, BLOCK, D]（BLOCK 轴 = tile 内 token）→ [B, H, nq, Demb]。"""
+    avg = tiles.mean(dim=3)
+    if mode == "avg":
+        return avg
+    mx = tiles.amax(dim=3)
+    if mode == "maxmin":
+        return torch.cat([mx, tiles.amin(dim=3)], dim=-1)
+    return torch.cat([avg, mx, tiles.amin(dim=3)], dim=-1)
+
+
+def _heuristic_scores(qpool, kpool):
+    """qpool/kpool: [B, H, nq, Demb] → scores [B, H, nq, nq]（逐头点积）。"""
+    B, H, nq, Demb = qpool.shape
+    q = qpool.reshape(B * H, nq, Demb)   # C-order：每个 (b,h) 一个 nq×Demb 块
+    k = kpool.reshape(B * H, nq, Demb)
+    s = torch.bmm(q, k.transpose(-2, -1)) * (float(Demb) ** -0.5)
+    return s.view(B, H, nq, nq)
+
+
+# ---------------------------------------------------------------------------
+# Veda block-sparse over packed sequence（带 conditioning sink）
+# ---------------------------------------------------------------------------
+
+def _veda_sparse_packed(qs, ks, vs, scale, keep_frac, cond_end, video_end,
+                        tripool_mode="triplet"):
+    """Packed 序列上的 block-sparse attention，conditioning 行恒 dense。
+
+    qs/ks/vs: [B=1, H, N, D]（H3 skip_reshape 布局，N=packed 全序列）。
+    cond_end: text+refs+audio 的结束行（video 段起点）。
+    video_end: video 段终点（packed 末段）。
+
+    语义：
+      * cond query 行（[:cond_end]）→ dense over 全部 key（text/audio 必须精确）。
+      * video query 行（[cond_end:video_end]）→ **联合 softmax**：
+        cond key 全量 + video key 的 TripPool top-k（含自身 tile）。
+      * 联合归一用 logsumexp 恒等（softmax([lc,lv]) = Σexp((x-m)v)/Σexp(x-m)），
+        不 concat 巨矩阵，峰值可控。
+    返回 [B, H, N, D]。
+    """
+    B, H, N, D = qs.shape
+    v_start = int(cond_end)
+    v_end = int(video_end)
+    v_len = v_end - v_start
+    scale = float(scale)
+
+    out = torch.empty_like(qs)
+
+    if v_start > 0:
+        # --- cond queries → dense over ALL keys ---------------------------------
+        qc = qs[:, :, :v_start]                     # [B,H,cond,D]
+        s_c = torch.matmul(qc.float(), ks.float().transpose(-2, -1)) * scale
+        p_c = s_c.softmax(dim=-1)
+        out[:, :, :v_start] = torch.matmul(p_c.to(vs.dtype), vs)
+
+    if v_len > 0:
+        # --- video queries → 联合 softmax：cond key 全量 + video key top-k ------
+        qv = qs[:, :, v_start:v_end]
+        kv = ks[:, :, v_start:v_end]
+        vv = vs[:, :, v_start:v_end]
+        kc = ks[:, :, :v_start] if v_start > 0 else None
+        vc = vs[:, :, :v_start] if v_start > 0 else None
+
+        # 视频内部：一维 64-token tile，TripPool 评分 + top-k
+        nv = (v_len + BLOCK - 1) // BLOCK
+        pad = nv * BLOCK - v_len
+        if pad:
+            qvp = torch.zeros(B, H, nv * BLOCK, D, dtype=qv.dtype, device=qv.device)
+            kvp = torch.zeros(B, H, nv * BLOCK, D, dtype=kv.dtype, device=kv.device)
+            vvp = torch.zeros(B, H, nv * BLOCK, D, dtype=vv.dtype, device=vv.device)
+            qvp[:, :, :v_len] = qv
+            kvp[:, :, :v_len] = kv
+            vvp[:, :, :v_len] = vv
+        else:
+            qvp, kvp, vvp = qv, kv, vv
+
+        qv_t = qvp.view(B, H, nv, BLOCK, D)
+        kv_t = kvp.view(B, H, nv, BLOCK, D)
+        qp = _tripool(qv_t, tripool_mode)          # [B,H,nv,Demb]
+        kp = _tripool(kv_t, tripool_mode)
+        scores = _heuristic_scores(qp, kp)         # [B,H,nv,nv]
+        topk = max(1, round(nv * keep_frac))
+        topk_idx = scores.topk(topk, dim=-1).indices   # [B,H,nv,topk]
+
+        # kvp/qvp/vvp 已是 [B,H,nv*BLOCK,D] 连续 tile 序；C-order reshape 到
+        # (b,h) 块即得正确 gather 布局（不要再 permute 打乱内存序）。
+        kvf = kvp.reshape(B * H, nv * BLOCK, D).contiguous()
+        vvf = vvp.reshape(B * H, nv * BLOCK, D).contiguous()
+        qvf = qvp.reshape(B * H, nv, BLOCK, D).contiguous()
+
+        tok_idx = (topk_idx * BLOCK).view(B * H, nv, topk, 1) + \
+                  torch.arange(BLOCK, device=qs.device).view(1, 1, 1, BLOCK)
+        tok_flat = tok_idx.view(B * H, nv, topk * BLOCK)
+
+        valid = torch.zeros(nv * BLOCK, dtype=torch.bool, device=qs.device)
+        valid[:v_len] = True
+
+        # 联合 softmax（logsumexp 恒等，不 concat，峰值可控）：
+        #   softmax([lc, lv]) 拆成 exp((x-m)*v) 分子 + Σ 分母，m = lv.max
+        # 按 query chunk 循环，避免 [.,.,m,cond+topk*BLOCK] 巨矩阵。
+        CHUNK = 32
+        pieces = []
+        for c in range(0, nv, CHUNK):
+            nb = min(CHUNK, nv - c)
+            q2 = qvf[:, c:c + nb].reshape(B * H * nb, BLOCK, D)
+            idx = tok_flat[:, c:c + nb]
+
+            gk = torch.gather(
+                kvf.unsqueeze(1).expand(B * H, nb, nv * BLOCK, D),
+                2, idx.unsqueeze(-1).expand(B * H, nb, topk * BLOCK, D)
+            ).reshape(B * H * nb, topk * BLOCK, D)
+            gv = torch.gather(
+                vvf.unsqueeze(1).expand(B * H, nb, nv * BLOCK, D),
+                2, idx.unsqueeze(-1).expand(B * H, nb, topk * BLOCK, D)
+            ).reshape(B * H * nb, topk * BLOCK, D)
+            gkm = valid[idx].reshape(B * H * nb, topk * BLOCK)
+
+            lv = torch.bmm(q2, gk.transpose(-2, -1)) * scale          # sparse video logits
+            lv = lv.masked_fill(~gkm[:, None, :].expand(-1, BLOCK, -1),
+                                float("-inf"))
+            mv = lv.amax(dim=-1, keepdim=True)
+            mv = torch.where(torch.isfinite(mv), mv,
+                             torch.zeros_like(mv))
+            elv = torch.exp(lv - mv)
+            sv = elv.sum(dim=-1, keepdim=True)
+
+            if kc is not None:
+                kc2 = kc.reshape(B * H, v_start, D).unsqueeze(1) \
+                    .expand(B * H, nb, v_start, D).reshape(B * H * nb, v_start, D)
+                lc = torch.bmm(q2, kc2.transpose(-2, -1).contiguous()) * scale  # cond logits
+                elc = torch.exp(lc - mv)
+                sc = elc.sum(dim=-1, keepdim=True)
+            else:
+                elc = None
+                sc = torch.zeros_like(sv)
+
+            denom = sv + sc
+            num = torch.bmm(elv, gv)
+            if elc is not None:
+                vc2 = vc.reshape(B * H, v_start, D).unsqueeze(1) \
+                    .expand(B * H, nb, v_start, D).reshape(B * H * nb, v_start, D)
+                num = num + torch.bmm(elc, vc2)
+            o = num / denom.clamp_min(1e-6)
+            pieces.append(o.reshape(B, H, nb, BLOCK, D))
+
+        o_sparse = torch.cat(pieces, dim=2).reshape(B, H, nv * BLOCK, D)[:, :, :v_len]
+        out[:, :, v_start:v_end] = o_sparse
+
+    return out
+
+
+def _build_selected(q, k, v, cond_end, video_end, keep_frac, tripool_mode):
+    """构造 selected-index：SelIdx [n_tile, MAX_SEL] int32 + SelCnt [n_tile]。
+
+    * query tile < cond_tiles（cond/混合行）→ SelCnt=-1（dense 哨兵，kernel 全循环）。
+    * video 纯 query tile → selected = cond 全部 key tile + TripPool top-k video tile。
+    返回 (SelIdx, SelCnt)。
+    """
+    B, H, N, D = q.shape
+    n_tile = (N + BLOCK - 1) // BLOCK
+    cond_tiles = (int(cond_end) + BLOCK - 1) // BLOCK
+
+    v_start = int(cond_end)
+    v_end = int(video_end)
+    v_len = v_end - v_start
+
+    if v_len <= 0 or cond_tiles >= n_tile:
+        # video 过短/无独立 tile：全 dense（SelCnt=-1 全行）
+        sel_cnt = torch.full((n_tile,), -1, dtype=torch.int32, device=q.device)
+        sel_idx = torch.zeros((n_tile, 1), dtype=torch.int32, device=q.device)
+        return sel_idx, sel_cnt
+
+    # 混合 tile（同时含 cond+video token）= v_start // BLOCK；其 query/key 都
+    # 走哨兵/全量。纯 video tile 从 ceil(v_start/BLOCK) = cond_tiles 开始。
+    pure0 = cond_tiles
+    nvg = n_tile - pure0
+    if nvg <= 1:
+        sel_cnt = torch.full((n_tile,), -1, dtype=torch.int32, device=q.device)
+        sel_idx = torch.zeros((n_tile, 1), dtype=torch.int32, device=q.device)
+        return sel_idx, sel_cnt
+
+    # 纯 video tile 的 TripPool top-k（同 _build_block_mask 逻辑）
+    vq = q[:, :, v_start:v_end]
+    vk = k[:, :, v_start:v_end]
+    off0 = pure0 * BLOCK - v_start
+    qp_tiles = []
+    kp_tiles = []
+    for j in range(nvg):
+        t0 = off0 + j * BLOCK
+        t1 = min(t0 + BLOCK, v_len)
+        qp_tiles.append(_tripool(vq[:, :, t0:t1].unsqueeze(2), tripool_mode)
+                        .squeeze(2))
+        kp_tiles.append(_tripool(vk[:, :, t0:t1].unsqueeze(2), tripool_mode)
+                        .squeeze(2))
+    qp = torch.stack(qp_tiles, dim=2)
+    kp = torch.stack(kp_tiles, dim=2)
+    scores = _heuristic_scores(qp, kp)
+    topk = max(1, round(nvg * keep_frac))
+    sc = scores.mean(dim=1)
+    topk_idx = sc.topk(topk, dim=-1).indices       # [B=1, nvg, topk]
+
+    # selected key tile 列表：cond 全部 + video top-k（全局索引）
+    cond_sel = torch.arange(cond_tiles, dtype=torch.int32, device=q.device) \
+        .unsqueeze(0).expand(nvg, cond_tiles)
+    vid_sel = (topk_idx[0] + pure0).to(torch.int32)    # [nvg, topk]
+    sel_all = torch.cat([cond_sel, vid_sel], dim=-1)   # [nvg, cond_tiles+topk]
+    max_sel = sel_all.shape[-1]
+
+    sel_idx = torch.zeros((n_tile, max_sel), dtype=torch.int32, device=q.device)
+    sel_cnt = torch.full((n_tile,), -1, dtype=torch.int32, device=q.device)
+    sel_idx[pure0:] = sel_all
+    sel_cnt[pure0:] = max_sel
+    return sel_idx, sel_cnt
+
+
+# ---------------------------------------------------------------------------
+# H3 Attention.forward monkey-patch（真路径）
 # ---------------------------------------------------------------------------
 
 def _video_span(layout):
@@ -94,731 +408,340 @@ def _video_span(layout):
     return next(((a, b) for a, b, kind in segments if kind == "video"), None)
 
 
-def _audio_span(layout):
-    segments = getattr(layout, "segments", None)
-    if not segments:
-        return None
-    return next(((a, b) for a, b, kind in segments if kind == "audio"), None)
+def _h3_attn_forward(self, x, rope_freqs=None, transformer_options=None):
+    """替换 H3 Attention.forward：逐行复刻前段（100% 同源）→ Veda 稀疏 → out_proj。"""
+    if transformer_options is None:
+        transformer_options = {}
 
+    # ---- 1) 与 H3 原 forward 完全一致的前段 --------------------------------
+    import comfy.model_management
+    import comfy.ldm.modules.attention as _attn_mod
+    AttentionTensorContainer = _attn_mod.AttentionTensorContainer
 
-def _patch_packed_layout(module):
-    """记录每个 PackedLayout 的 video/audio span 与 latent 三维尺寸，不改动布局对象。"""
-    layout_cls = getattr(module, "PackedLayout", None)
-    if layout_cls is None:
-        raise RuntimeError(f"{module.__name__} has no PackedLayout")
-    if id(layout_cls) in _PATCHED_LAYOUTS:
-        return
-    original_init = layout_cls.__init__
-
-    def __init__(self, text_len, latent_t, latent_h, latent_w, audio_t, *args, **kwargs):
-        original_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
-                      *args, **kwargs)
-        try:
-            span = _video_span(self)
-            latent_dims = (int(latent_t), int(latent_h), int(latent_w))
-        except Exception:                                   # never break construction
-            span, latent_dims = None, None
-        if torch.is_tensor(getattr(self, "position_ids", None)) and span is not None:
-            _SPANS[id(self.position_ids)] = (self, span, _audio_span(self), latent_dims)
-
-    layout_cls.__init__ = __init__
-    _PATCHED_LAYOUTS.add(id(layout_cls))
-
-
-def install_h3_span(model):
-    """幂等地把 H3 的 video/audio span 与 latent 尺寸发布进 transformer_options。
-
-    非 H3 扩散模型（缺 .blocks/.rope_freqs/._forward）直接抛错，由节点捕获。
-    可对同一对象重复调用。
-    """
-    if id(model) in _SPAN_INSTALLED:
-        return
-    for attr in ("rope_freqs", "_forward", "blocks"):
-        if not hasattr(model, attr):
-            raise RuntimeError(
-                "BSAI VedaSparse expects a MiniMax-H3 diffusion model "
-                f"(.{attr} missing on {type(model).__name__}).")
-
-    _patch_packed_layout(sys.modules[type(model).__module__])
-    original_forward = model._forward
-    original_rope = model.rope_freqs
-
-    def _forward(x, timestep, context, transformer_options={}, **kwargs):
-        model._veda_options = transformer_options
-        try:
-            return original_forward(x, timestep, context,
-                                    transformer_options=transformer_options, **kwargs)
-        finally:
-            model._veda_options = None
-            transformer_options.pop("h3_video_span", None)
-            transformer_options.pop("h3_audio_span", None)
-            transformer_options.pop("h3_latent_dims", None)
-
-    def rope_freqs(position_ids, device):
-        entry = _SPANS.get(id(position_ids))
-        if entry is not None:
-            options = getattr(model, "_veda_options", None)
-            if options is not None:
-                options["h3_video_span"] = entry[1]
-                options["h3_audio_span"] = entry[2]
-                options["h3_latent_dims"] = entry[3]
-        return original_rope(position_ids, device)
-
-    model._forward = _forward
-    model.rope_freqs = rope_freqs
-    _SPAN_INSTALLED.add(id(model))
-
-
-def veda_stats():
-    """进程内分发计数（只读诊断）。"""
-    return dict(_STATS)
-
-
-def reset_veda_stats():
-    for key in _STATS:
-        _STATS[key] = 0
-    _SEEN.clear()
-
-
-def _log_once(key, message):
-    if key not in _SEEN:
-        _SEEN.add(key)
-        logging.info(f"[BSAI VedaSparse] {message}")
-
-
-# ---------------------------------------------------------------------------
-# TripPool 描述符与评分
-# ---------------------------------------------------------------------------
-
-def _tripool(tiles, mode="triplet"):
-    """tiles: [B, n_tiles, tile_tokens, H, D] -> [B, n_tiles, H, D_emb].
-
-    TripPool = Avg ⊕ Max ⊕ Min（论文 eq.5）。mode 控制统计量组合：
-      triplet: avg+max+min（论文最优，Table 2 最低损失）
-      maxmin:  max+min
-      avg:     仅平均（即 VSA 的评分信号，保留作对比）
-    """
-    avg = tiles.mean(dim=2)                                  # [B, n, H, D]
-    if mode == "avg":
-        return avg
-    mx = tiles.amax(dim=2)
-    if mode == "maxmin":
-        return torch.cat([mx, tiles.amin(dim=2)], dim=-1)
-    return torch.cat([avg, mx, tiles.amin(dim=2)], dim=-1)   # [B, n, H, 3D]
-
-
-def _heuristic_scores(qpool, kpool, scale):
-    """φ=identity 的 TripPool 评分（论文 eq.6 单位投影形式）。
-
-    qpool/kpool: [B, n_tiles, H, D_emb] -> scores [B, H, n_tiles, n_tiles]。
-    """
-    B, nq, H, Demb = qpool.shape
-    q = qpool.permute(0, 2, 1, 3).reshape(B * H, nq, Demb)
-    k = kpool.permute(0, 2, 1, 3).reshape(B * H, nq, Demb)
-    d_emb = float(Demb) ** -0.5
-    s = torch.bmm(q, k.transpose(-2, -1)) * d_emb           # [BH, nq, nq]
-    return s.view(B, H, nq, nq)                             # [B, H, nq, nq]
-
-
-class _DistilledScorer(torch.nn.Module):
-    """VedaSparse 蒸馏预测器（预留）：每头独立 MLP 投影 φ_q / φ_k。
-
-    加载 safetensors 后启用；未提供权重时节点走 heuristic 路径，本类不实例化。
-    Key 规范见 VEDA_SCORER_KEY_SPEC：
-      vedascorer.layer_{l}.head_{h}.q_proj / k_proj   [in=3*d_head, out=d_latent]
-    """
-
-    def __init__(self, state_dict, num_heads, d_head):
-        super().__init__()
-        self.proj = torch.nn.ModuleList()
-        layers = set()
-        heads = set()
-        for key in state_dict:
-            parts = key.split(".")
-            if len(parts) == 5 and parts[0] == "vedascorer":
-                layers.add(int(parts[1]))
-                heads.add(int(parts[2]))
-        for l in sorted(layers):
-            head_projs = torch.nn.ModuleList()
-            for h in sorted(heads):
-                qp = torch.nn.Linear(state_dict[f"vedascorer.layer_{l}.head_{h}.q_proj"]
-                                     .shape[-1],
-                                     state_dict[f"vedascorer.layer_{l}.head_{h}.q_proj"]
-                                     .shape[0], bias=False)
-                kp = torch.nn.Linear(state_dict[f"vedascorer.layer_{l}.head_{h}.k_proj"]
-                                     .shape[-1],
-                                     state_dict[f"vedascorer.layer_{l}.head_{h}.k_proj"]
-                                     .shape[0], bias=False)
-                with torch.no_grad():
-                    qp.weight.copy_(state_dict[f"vedascorer.layer_{l}.head_{h}.q_proj"])
-                    kp.weight.copy_(state_dict[f"vedascorer.layer_{l}.head_{h}.k_proj"])
-                head_projs.append(torch.nn.ModuleDict({"q": qp, "k": kp}))
-            head_projs.to(next(iter(state_dict.values())).dtype)
-            self.proj.append(head_projs)
-        self.layers = sorted(layers)
-        self.heads = sorted(heads)
-
-    def score(self, qpool, kpool, layer, head, d_latent_scale=True):
-        """对指定层/头计算投影评分。qpool/kpool: [B, n, D_emb]。"""
-        hp = self.proj[self.layers.index(layer)][self.heads.index(head)]
-        q = hp["q"](qpool)
-        k = hp["k"](kpool)
-        return torch.bmm(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-
-
-# ---------------------------------------------------------------------------
-# Head-Aware Tiling
-# ---------------------------------------------------------------------------
-
-def resolve_geometry(video_span_len, latent_dims, aspect, force_dims=None):
-    """把 video span 解析为 (T, H, W) 三维 token 布局。
-
-    优先级：
-      1. force_dims（节点手动指定 (T,H,W)）
-      2. PackedLayout 记录的 latent_dims（含 patchify 前后两种校验）
-      3. duration + aspect 反推（latent 短边 24 = 768px/32，patchify 1×2×2 后）
-      4. 失败返回 None -> 引擎退避一维立方 tile（仅评分升级，保持兼容）
-    """
-    if force_dims is not None:
-        t, h, w = force_dims
-        if t * h * w == video_span_len:
-            return (t, h, w)
-    if latent_dims is not None:
-        t, h, w = latent_dims
-        if t * h * w == video_span_len:
-            return (t, h, w)
-        t2, h2, w2 = t, h // 2, w // 2                     # patchify 1×2×2 变体
-        if h % 2 == 0 and w % 2 == 0 and t2 * h2 * w2 == video_span_len:
-            return (t2, h2, w2)
-    # 按画幅比例反推：短边 latent 24（768px/32），宽边按 aspect
-    ratio = {"16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3,
-             "3:4": 3 / 4, "1:1": 1.0}.get(aspect, 16 / 9)
-    if video_span_len > 0:
-        h = 24
-        w = max(1, int(round(h * ratio)))
-        # 尝试几个合理 (h, w) 组合
-        for hh in (24, 32, 16, 12, 8):
-            for ww in (int(round(hh * ratio)),):
-                if ww <= 0:
-                    continue
-                if video_span_len % (hh * ww) == 0:
-                    t = video_span_len // (hh * ww)
-                    if t > 0:
-                        return (t, hh, ww)
-        # 最后尝试任意 (h,w) 分解（质因数近似）
-        s = int(round(math.sqrt(video_span_len)))
-        for hh in range(max(1, s // 8), s + 1):
-            if hh * hh > video_span_len:
-                break
-            if video_span_len % hh == 0:
-                ww = video_span_len // hh
-                if ww <= 8 * hh:
-                    return (1, hh, ww)
-    return None
-
-
-def _tile_3d(xv, T, H, W, pt, ph, pw, heads, d):
-    """把 video span [B, vn, Hd, D] 按 (pt, ph, pw) 分块。
-
-    返回 (tiles, n_tiles, (Tp, Hp, Wp), key_mask)：
-      tiles: [B, n_tiles, pt*ph*pw, Hd, D]
-      key_mask: [n_tiles, pt*ph*pw]（False=padding token，不应参与 softmax）
-    token 排列假设为 (t, h, w) 展平（t 最慢、w 最快，MM-RoPE 三维）。
-    """
-    B, vn, Hd, D = xv.shape
-    x3 = xv.view(B, T, H, W, Hd, D)
-    Tp, Hp, Wp = -(-T // pt), -(-H // ph), -(-W // pw)
-    if Tp * pt != T or Hp * ph != H or Wp * pw != W:
-        pad_t = Tp * pt - T
-        pad_h = Hp * ph - H
-        pad_w = Wp * pw - W
-        x3 = F.pad(x3, (0, 0, 0, 0, 0, pad_w, 0, pad_h, 0, pad_t))
-    # [B, Tp, pt, Hp, ph, Wp, pw, Hd, D] -> tiles [B, Tp*Hp*Wp, pt*ph*pw, Hd, D]
-    tiles = x3.view(B, Tp, pt, Hp, ph, Wp, pw, Hd, D)
-    tiles = tiles.permute(0, 1, 3, 5, 2, 4, 6, 7, 8)
-    tiles = tiles.reshape(B, Tp * Hp * Wp, pt * ph * pw, Hd, D)
-    # 有效 key mask：真实 (T,H,W) 网格内的 token 为 True
-    valid = torch.zeros(Tp * pt, Hp * ph, Wp * pw, dtype=torch.bool,
-                        device=xv.device)
-    valid[:T, :H, :W] = True
-    key_mask = valid.view(Tp, pt, Hp, ph, Wp, pw).permute(0, 2, 4, 1, 3, 5)
-    key_mask = key_mask.reshape(Tp * Hp * Wp, pt * ph * pw)
-    return tiles, Tp * Hp * Wp, (Tp, Hp, Wp), key_mask
-
-
-# ---------------------------------------------------------------------------
-# tile-skipping 稀疏注意力（每 tiling 组一个结构，组内头共享；评分逐头）
-# ---------------------------------------------------------------------------
-
-def _veda_sparse(qs, ks, vs, scale, keep_frac, video_start, video_end,
-                 sink_conditioning, verbose, head_tilings, tripool_mode,
-                 scorer, latent_dims, aspect, force_dims):
-    """Block-sparse attention over the video span with head-aware tiling.
-
-    qs/ks/vs: [B, N, H, D]（N=packed 序列，H=注意力头，D=head_dim）。
-    head_tilings: per-head 的 (pt, ph, pw) 列表（长度=H，或长度<H 时循环）。
-    返回 [B, N, H, D]。
-    """
-    B, N, Hd, D = qs.shape
-    cond_end = int(video_start)
-    vn = int(video_end) - cond_end
-    out = torch.empty_like(qs)
-
-    def _attn(qr, kr, vr):
-        b, lq, h, d = qr.shape
-        lk = kr.shape[1]
-        q2 = qr.transpose(1, 2).reshape(b * h, lq, d)
-        k2 = kr.transpose(1, 2).reshape(b * h, lk, d).transpose(-2, -1)
-        att = torch.bmm(q2, k2) * scale
-        att = att.softmax(dim=-1)
-        o = torch.bmm(att, vr.transpose(1, 2).reshape(b * h, lk, d))
-        return o.reshape(b, h, lq, d).transpose(1, 2)
-
-    # --- conditioning（text/audio/ref）行：始终 dense，逐块限内存 -------------
-    if cond_end > 0:
-        for i in range(0, cond_end, 256):
-            j = min(i + 256, cond_end)
-            out[:, i:j] = _attn(qs[:, i:j], ks, vs)
-    if vn <= 0:
-        out[:, cond_end:] = _attn(qs[:, cond_end:], ks, vs)
-        return out
-
-    # --- 几何解析 ----------------------------------------------------------
-    geom = resolve_geometry(vn, latent_dims, aspect, force_dims)
-    qv_raw = qs[:, cond_end:video_end]
-    kv_raw = ks[:, cond_end:video_end]
-    vv_raw = vs[:, cond_end:video_end]
-
-    if geom is None:
-        # 一维退避：固定 64-token 立方 tile（FastVideo VSA 几何），
-        # 评分仍升级为 TripPool。保证任何分辨率都能跑。
-        _STATS["fallback_1d"] += 1
-        if verbose:
-            _log_once("fallback1d", "geometry unresolved -> 64-token cubic tiling")
-        return _veda_1d_fallback(qv_raw, kv_raw, vv_raw, qs, ks, vs, scale,
-                                 keep_frac, cond_end, video_end,
-                                 sink_conditioning, tripool_mode, scorer, out)
-
-    T, Hlat, Wlat = geom
-    # 归一化 head 分块表：长度=Hd，不足循环
-    tilings = []
-    for h in range(Hd):
-        tilings.append(head_tilings[h % len(head_tilings)])
-
-    # 按 tiling 分组（相同 (pt,ph,pw) 的头归一组，共享 tile 结构）
-    groups = {}
-    for h, cfg in enumerate(tilings):
-        groups.setdefault(cfg, []).append(h)
-    group_cfgs = list(groups.keys())
-
-    # 为每组的 tile 结构做准备（q/k/v 都按组切）
-    per_group = {}
-    for cfg in group_cfgs:
-        pt, ph, pw = cfg
-        qt, nt, (Tp, Hp, Wp), _ = _tile_3d(qv_raw, T, Hlat, Wlat, pt, ph, pw, Hd, D)
-        kt, _, _, km = _tile_3d(kv_raw, T, Hlat, Wlat, pt, ph, pw, Hd, D)
-        vt, _, _, _ = _tile_3d(vv_raw, T, Hlat, Wlat, pt, ph, pw, Hd, D)
-        per_group[cfg] = (qt, kt, vt, nt, km)
-
-    # --- 逐组：TripPool 评分（逐头） + top-k + gather 稀疏注意力 --------------
-    use_cond = sink_conditioning != "off" and cond_end > 0
-    if use_cond:
-        ck = ks[:, :cond_end]
-        cv = vs[:, :cond_end]
-
-    ov_parts = {}                                           # head -> out tensor
-    for cfg in group_cfgs:
-        heads = groups[cfg]
-        qt, kt, vt, nt, km = per_group[cfg]
-        topk = max(1, round(nt * keep_frac))
-        # TripPool 描述符：tiles [B, nt, ts, H, D] -> pool [B, nt, H, Demb]
-        qp = _tripool(qt, tripool_mode)
-        kp = _tripool(kt, tripool_mode)
-        hs = heads
-
-        if scorer is not None and scorer.layers:
-            # 蒸馏模式：每头独立 MLP 投影（仅对存在的层/头；缺失头回退启发）
-            qp_p = qp.permute(0, 2, 1, 3).reshape(B * Hd, nt, qp.shape[-1])
-            kp_p = kp.permute(0, 2, 1, 3).reshape(B * Hd, nt, kp.shape[-1])
-            scores_h = torch.empty(B * Hd, nt, nt, device=qs.device, dtype=qp.dtype)
-            for h in range(Hd):
-                try:
-                    s = scorer.score(qp_p[h * B:(h + 1) * B] if B > 1 else qp_p,
-                                     kp_p[h * B:(h + 1) * B] if B > 1 else kp_p,
-                                     layer=0, head=h)
-                except (IndexError, KeyError):
-                    q2 = qp_p[h * B:(h + 1) * B] if B > 1 else qp_p
-                    k2 = kp_p[h * B:(h + 1) * B] if B > 1 else kp_p
-                    s = torch.bmm(q2, k2.transpose(-2, -1)) * (q2.shape[-1] ** -0.5)
-                scores_h[h * B:(h + 1) * B] = s if B > 1 else s
-            scores = scores_h.view(B, Hd, nt, nt)
-            _STATS["distilled"] += 1
+    s = x.shape[0]
+    q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
+    v = v.view(s, self.heads, self.head_dim)
+    if rope_freqs is not None:
+        q = q.view(1, s, self.heads, self.head_dim)
+        k = k.view(1, s, self.heads, self.head_dim)
+        qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
+        kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
+        rot = rope_freqs.shape[-3] * 2
+        if comfy.model_management.in_training:
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(
+                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
         else:
-            scores = _heuristic_scores(qp, kp, scale)       # [B, H, nt, nt]
-            _STATS["heuristic"] += 1
+            comfy.quant_ops.ck.rms_rope_split_half_(
+                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
+        q = q[0]
+        k = k[0]
+    else:
+        q = self.q_norm(q.view(s, self.heads, self.head_dim))
+        k = self.k_norm(k.view(s, self.heads, self.head_dim))
 
-        # top-k 逐头
-        sc = scores.reshape(B * Hd, nt, nt)
-        topk_idx = sc.topk(topk, dim=-1).indices            # [BH, nt, topk]
+    q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
+    k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
+    v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
 
-        # gather + sparse attention：行选择（连续 tile 拷贝）+ 分块。
-        # 每个 tile 的 64 token 连续存储 -> 按 (batch,head,tile) 行号高级索引，
-        # 一次拷贝整个 tile（连续读），索引读取量比 token 级 gather 小 ~4000x。
-        # 显存峰值由 CHUNK 控制（约 300MB），远小于原全头 gather 的 6.7GB。
-        Hg = len(heads)
-        ts_ = qt.shape[2]
-        idx_h = topk_idx.view(B, Hd, nt, topk)[:, heads, :, :].to(torch.int32)  # [B, Hg, nt, topk]
-        b_off = torch.arange(B, device=qs.device, dtype=torch.int32).view(B, 1, 1, 1) * (Hg * nt)
-        h_off = torch.arange(Hg, device=qs.device, dtype=torch.int32).view(1, Hg, 1, 1) * nt
-        kt2 = kt[:, :, :, heads, :].permute(0, 3, 1, 2, 4).reshape(B * Hg * nt, ts_ * D)
-        vt2 = vt[:, :, :, heads, :].permute(0, 3, 1, 2, 4).reshape(B * Hg * nt, ts_ * D)
-        qv2 = qt[:, :, :, heads, :].permute(0, 3, 1, 2, 4).reshape(B, Hg, nt, ts_, D)
-        if use_cond:
-            ck_h = ck[:, :, heads, :].permute(0, 2, 1, 3)              # [B, Hg, cond_end, D]
-            cv_h = cv[:, :, heads, :].permute(0, 2, 1, 3)
+    # ---- 2) attention 调用段（替换点） --------------------------------------
+    out = _h3_attn_call(self, q, k, v, transformer_options,
+                        _attn_mod.optimized_attention, AttentionTensorContainer)
 
-        CHUNK = max(8, min(32, (256 * 1024 * 1024) // (Hg * topk * ts_ * D * 2)))
-        pieces = []
-        for i in range(0, nt, CHUNK):
-            j = min(i + CHUNK, nt)
-            nb = j - i
-            row_b = (b_off + h_off + idx_h[:, :, i:j]).reshape(-1)     # [B*Hg*nb*topk]
-            gk = kt2[row_b].view(B * Hg * nb, topk, ts_, D).reshape(B * Hg * nb, topk * ts_, D)
-            gv = vt2[row_b].view(B * Hg * nb, topk, ts_, D).reshape(B * Hg * nb, topk * ts_, D)
-            gkm = km[idx_h[:, :, i:j]].view(B * Hg * nb, topk * ts_)
-            q2 = qv2[:, :, i:j].reshape(B * Hg * nb, ts_, D)
-            if use_cond:
-                ck_b = ck_h.unsqueeze(2).expand(B, Hg, nb, cond_end, D).reshape(
-                    B * Hg * nb, cond_end, D)
-                cv_b = cv_h.unsqueeze(2).expand(B, Hg, nb, cond_end, D).reshape(
-                    B * Hg * nb, cond_end, D)
-                k2 = torch.cat([ck_b, gk], dim=1)
-                v2 = torch.cat([cv_b, gv], dim=1)
-                key_mask = torch.cat(
-                    [torch.ones(B * Hg * nb, cond_end, dtype=torch.bool,
-                                device=qs.device), gkm], dim=1)
-            else:
-                k2, v2 = gk, gv
-                key_mask = gkm
-            att = torch.bmm(q2, k2.transpose(-2, -1)) * scale
-            att = att.masked_fill(~key_mask[:, None, :].expand(-1, ts_, -1),
-                                  float("-inf"))
-            att = att.softmax(dim=-1)
-            att = att.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)      # 全掩码行防护
-            pieces.append(torch.bmm(att, v2).reshape(B, Hg, nb, ts_, D))
-        ovg = torch.cat(pieces, dim=2)                                 # [B, Hg, nt, ts_, D]
-        for j, h in enumerate(heads):
-            ov_parts[h] = ovg[:, j]
-
-    # --- 写回 video span（按 head 逐列） --------------------------------------
-    # ov 形状 [B, vn, H, D]：需要把每头结果 un-tile 回原始 (t,h,w) 顺序
-    # 简化：由于不同头 tile 结构不同，这里按组分别 un-tile 再写回。
-    for cfg in group_cfgs:
-        heads = groups[cfg]
-        qt, kt, vt, nt, km = per_group[cfg]
-        pt, ph, pw = cfg
-        for h in heads:
-            oh = ov_parts[h]                                 # [B, nt, ts, D]
-            # un-tile：nt tiles x (pt*ph*pw) -> 原始 (T, H, W)
-            Tp, Hp, Wp = -(-T // pt), -(-Hlat // ph), -(-Wlat // pw)
-            oh3 = oh.view(B, Tp, Hp, Wp, pt, ph, pw, D)
-            oh3 = oh3.permute(0, 1, 4, 2, 5, 3, 6, 7).reshape(B, Tp * pt, Hp * ph,
-                                                              Wp * pw, D)
-            ohv = oh3[:, :T, :Hlat, :Wlat].reshape(B, vn, D)
-            out[:, cond_end:video_end, h, :] = ohv
-    return out
+    # ---- 3) 与 H3 原 forward 完全一致的收尾 --------------------------------
+    return self.out_proj(out.squeeze(0))
 
 
-def _veda_1d_fallback(qv, kv, vv, qs, ks, vs, scale, keep_frac, cond_end,
-                      video_end, sink_conditioning, tripool_mode, scorer, out):
-    """一维 64-token 立方 tile 退避（FastVideo VSA 几何 + TripPool 评分）。
+def _h3_attn_call(self, q, k, v, transformer_options,
+                  optimized_attention, AttentionTensorContainer):
+    """在 optimized_attention 调用点做 dense/sparse 分流。
 
-    用于几何无法解析（任意分辨率/帧数）时保证可用性。
+    container 只在确认走 sparse 时才 take；任何 fallback 都保证不传空 container。
     """
-    B, vn, Hd, D = qv.shape
-    nvb = (vn + BLOCK - 1) // BLOCK
-    pad = nvb * BLOCK - vn
+    global _FALLBACK_TO_DENSE
 
-    # conditioning（text/audio/ref）行始终 dense（与主路径一致）
-    if cond_end > 0:
-        for i in range(0, cond_end, 256):
-            j = min(i + 256, cond_end)
-            b2, nq, h2, d2 = qs[:, i:j].shape
-            q2c = qs[:, i:j].transpose(1, 2).reshape(b2 * h2, nq, d2)
-            k2c = ks.transpose(1, 2).reshape(b2 * h2, ks.shape[1], d2)
-            attc = torch.bmm(q2c, k2c.transpose(-2, -1)) * scale
-            attc = attc.softmax(dim=-1)
-            oc = torch.bmm(attc, vs.transpose(1, 2).reshape(b2 * h2, vs.shape[1], d2))
-            out[:, i:j] = oc.reshape(b2, h2, nq, d2).transpose(1, 2)
+    params = getattr(self, "_bsai_veda_params", None)
 
-    def _slice(t):
-        if not pad:
-            return t
-        return F.pad(t, (0, 0, 0, 0, 0, pad, 0, 0))
+    def dense():
+        _STATS["dense"] += 1
+        # 复刻 wrap_attn 的 preferred_attention 语义（去掉 override 键防递归）
+        to = dict(transformer_options)
+        to.pop("optimized_attention_override", None)
+        return optimized_attention(
+            q, k, v, self.heads, preferred_attention=self.comfy_attention,
+            mask=None, skip_reshape=True, transformer_options=to)
 
-    qvv = _slice(qv).view(B, nvb, BLOCK, Hd, D)
-    kvv = _slice(kv).view(B, nvb, BLOCK, Hd, D)
-    vvv = _slice(vv).view(B, nvb, BLOCK, Hd, D)
+    def dense_tensors(qs, ks, vs):
+        _STATS["dense"] += 1
+        to = dict(transformer_options)
+        to.pop("optimized_attention_override", None)
+        return optimized_attention(
+            qs, ks, vs, self.heads, preferred_attention=self.comfy_attention,
+            mask=None, skip_reshape=True, transformer_options=to)
 
-    qp = _tripool(qvv, tripool_mode)
-    kp = _tripool(kvv, tripool_mode)
-    scores = _heuristic_scores(qp, kp, scale)               # [B, H, nvb, nvb]
-    topk = max(1, round(nvb * keep_frac))
-    sc = scores.reshape(B * Hd, nvb, nvb)
-    topk_idx = sc.topk(topk, dim=-1).indices
+    if params is None or not params.get("enabled", False):
+        return dense()
+    if _FALLBACK_TO_DENSE:
+        return dense()
 
-    use_cond = sink_conditioning != "off" and cond_end > 0
-    if use_cond:
-        ck = ks[:, :cond_end].permute(0, 2, 1, 3).reshape(B * Hd, cond_end, D)
-        cv = vs[:, :cond_end].permute(0, 2, 1, 3).reshape(B * Hd, cond_end, D)
-
-    qv2 = qvv.permute(0, 3, 1, 2, 4).reshape(B * Hd, nvb, BLOCK, D)
-    kvf = kvv.permute(0, 3, 1, 2, 4).reshape(B * Hd, nvb * BLOCK, D)
-    vvf = vvv.permute(0, 3, 1, 2, 4).reshape(B * Hd, nvb * BLOCK, D)
-    tok_idx = (topk_idx * BLOCK).unsqueeze(-1) + torch.arange(BLOCK, device=qs.device)
-    tok_flat = tok_idx.reshape(B * Hd, nvb, topk * BLOCK)
-    # 有效 video token mask（padding 不参与 softmax）
-    valid_video = torch.zeros(nvb * BLOCK, dtype=torch.bool, device=qs.device)
-    valid_video[:vn] = True
-
-    CHUNK = 4
-    pieces = []
-    for i in range(0, nvb, CHUNK):
-        j = min(i + CHUNK, nvb)
-        nb = j - i
-        q2 = qv2[:, i:j].reshape(B * Hd * nb, BLOCK, D)
-        idx = tok_flat[:, i:j]
-        gk = torch.gather(kvf.unsqueeze(1).expand(B * Hd, nb, nvb * BLOCK, D),
-                          2, idx.unsqueeze(-1).expand(B * Hd, nb, topk * BLOCK, D)
-                          ).reshape(B * Hd * nb, topk * BLOCK, D)
-        gv = torch.gather(vvf.unsqueeze(1).expand(B * Hd, nb, nvb * BLOCK, D),
-                          2, idx.unsqueeze(-1).expand(B * Hd, nb, topk * BLOCK, D)
-                          ).reshape(B * Hd * nb, topk * BLOCK, D)
-        gkm = valid_video[idx].reshape(B * Hd * nb, topk * BLOCK)
-        if use_cond:
-            k2 = torch.cat([ck.unsqueeze(1).expand(B * Hd, nb, cond_end, D)
-                            .reshape(B * Hd * nb, cond_end, D), gk], dim=1)
-            v2 = torch.cat([cv.unsqueeze(1).expand(B * Hd, nb, cond_end, D)
-                            .reshape(B * Hd * nb, cond_end, D), gv], dim=1)
-            key_mask = torch.cat(
-                [torch.ones(B * Hd * nb, cond_end, dtype=torch.bool,
-                            device=qs.device), gkm], dim=1)
-        else:
-            k2, v2 = gk, gv
-            key_mask = gkm
-        att = torch.bmm(q2, k2.transpose(-2, -1)) * scale
-        att = att.masked_fill(~key_mask[:, None, :].expand(-1, BLOCK, -1),
-                              float("-inf"))
-        att = att.softmax(dim=-1)
-        att = att.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
-        pieces.append(torch.bmm(att, v2).reshape(B, Hd, nb, BLOCK, D))
-    ov = torch.cat(pieces, dim=2).permute(0, 2, 3, 1, 4).reshape(B, nvb * BLOCK, Hd, D)
-    out[:, cond_end:video_end] = ov[:, :vn]
-    return out
-
-
-# ---------------------------------------------------------------------------
-# override builder（注入 transformer_options["optimized_attention_override"]）
-# ---------------------------------------------------------------------------
-
-def make_veda_override(*, keep_frac, min_tokens, sigma_start, sigma_end,
-                       sink_conditioning, head_tilings, tripool_mode,
-                       scorer, latent_dims, aspect, force_dims, verbose,
-                       previous=None):
-    def override(func, q, k, v, heads, mask=None, attn_precision=None,
-                 skip_reshape=False, skip_output_reshape=False, **kwargs):
-        def dense():
-            target = func if previous is None else partial(previous, func)
-            return target(q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                          skip_reshape=skip_reshape,
-                          skip_output_reshape=skip_output_reshape, **kwargs)
-
-        if mask is not None:
-            _STATS["dense"] += 1
-            return dense()
-
-        if skip_reshape:
-            b, _, _, dim_head = q.shape                        # BHND
-            qs, ks, vs = (t.transpose(1, 2) for t in (q, k, v))
-        else:
-            b, _, dim_head = q.shape                           # B, N, heads*dim_head
-            dim_head //= heads
-            qs, ks, vs = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-
-        # sigma 窗口（前 20% 步 dense 预热，与 FastH3/ComfyUI 一致）
-        if sigma_start is not None or sigma_end is not None:
-            sigmas = kwargs.get("transformer_options", {}).get("sigmas")
-            if sigmas is not None:
-                sigma = float(sigmas[0])
-                if (sigma_start is not None and sigma > sigma_start) or \
-                   (sigma_end is not None and sigma < sigma_end):
-                    _STATS["dense"] += 1
-                    return dense()
-
-        options = kwargs.get("transformer_options") or {}
-        span = options.get("h3_video_span")
+    try:
+        layout = transformer_options.get("minimax_h3_layout")
+        span = _video_span(layout) if layout is not None else None
         if span is None:
             _STATS["dense"] += 1
-            if verbose:
-                _log_once("nospan", "no H3 video span published; dense")
             return dense()
         video_start, video_end = span
-        tokens = qs.shape[1]
-        if tokens < min_tokens or tokens < int(video_end):
+
+        # token 数 / 序列长度自适应 / sigma 窗口（peek 不消费 container）
+        qt = q.peek()                                  # [B,H,N,D]（skip_reshape）
+        N = qt.shape[2]
+        if N < params["min_tokens"] or N != k.peek().shape[2]:
             _STATS["dense"] += 1
             return dense()
-        if qs.shape[1] != ks.shape[1]:                         # cross-attention
+        # 超长 packed 序列（H3 5s 视频 = 182 万 token）：top-k 稀疏的 K/V 重复
+        # 加载量 >> dense split-KV 单次加载，数学上必输——强制 dense 不拖慢。
+        if N >= params.get("max_sparse_tokens", 16384):
             _STATS["dense"] += 1
             return dense()
 
-        scale = kwargs.get("scale", dim_head ** -0.5)
-        lat_dims = options.get("h3_latent_dims")
+        sigmas = transformer_options.get("sigmas")
+        if sigmas is not None:
+            sigma = float(sigmas[0])
+            # 低步数 ladder（蒸馏/Turbo，<=5 步）：全步稀疏——否则 TaoMate
+            # 4 步的 [0.9999,0.973,0.9231,0.0] 前 3 步全被 sigma_start 挡成
+            # dense，稀疏等于没开。常规多步采样仍保留"早期噪声步 dense"保护。
+            low_step = len(sigmas) <= 5
+            if (not low_step and sigma > params["sigma_start"]) \
+                    or sigma < params["sigma_end"]:
+                _STATS["dense"] += 1
+                return dense()
+
+        qs, ks, vs = q.take(), k.take(), v.take()      # [B,H,N,D]
+        dim_head = qs.shape[-1]
+        scale = float(dim_head ** -0.5)
+        cond_end = int(video_start)
+
+        # ---- 稀疏执行：Triton → PyTorch sparse → tensor dense -----------------
+        if _TRITON_SPARSE_AVAILABLE and _ENABLE_TRITON:
+            try:
+                sel_idx, sel_cnt = _build_selected(
+                    qs, ks, vs, cond_end, video_end,
+                    params["keep_frac"], params["tripool"])
+                out_s = _triton_sparse_attention(qs, ks, vs, sel_idx, sel_cnt)
+                _STATS["sparse"] += 1
+                return out_s.permute(0, 2, 1, 3).reshape(1, N, qs.shape[1] * dim_head)
+            except Exception as exc:
+                _STATS["errors"] += 1
+                if "out of memory" in str(exc).lower():
+                    _FALLBACK_TO_DENSE = True
+                logging.warning(f"[BSAI VedaSparse v3.4] triton sparse failed "
+                                f"({type(exc).__name__}: {exc}) -> PyTorch sparse")
+
         try:
-            out = _veda_sparse(qs, ks, vs, scale, keep_frac, video_start, video_end,
-                               sink_conditioning, verbose, head_tilings,
-                               tripool_mode, scorer, lat_dims, aspect, force_dims)
+            out_s = _veda_sparse_packed(qs, ks, vs, scale, params["keep_frac"],
+                                        cond_end, video_end, params["tripool"])
+            _STATS["sparse"] += 1
+            return out_s.permute(0, 2, 1, 3).reshape(1, N, qs.shape[1] * dim_head)
         except Exception as exc:
             _STATS["errors"] += 1
             if "out of memory" in str(exc).lower():
-                _log_once("oom", "CUDA OOM in sparse attention; falling back to "
-                                 "dense. If it recurs, reduce resolution/frames or "
-                                 "use the fp8 model, and close other VRAM-heavy apps.")
-            else:
-                logging.error(f"[BSAI VedaSparse] engine failed ({exc}); dense fallback",
-                              exc_info=verbose)
-            return dense()
-        _STATS["sparse"] += 1
-        if skip_output_reshape:
-            return out.transpose(1, 2)
-        return out.reshape(b, -1, heads * dim_head)
+                _FALLBACK_TO_DENSE = True
+            logging.warning(f"[BSAI VedaSparse v3.4] pytorch sparse failed "
+                            f"({type(exc).__name__}: {exc}) -> dense")
+            return dense_tensors(qs, ks, vs)
+    except Exception as exc:
+        _STATS["errors"] += 1
+        logging.warning(f"[BSAI VedaSparse v3.4] attn_call error "
+                        f"({type(exc).__name__}: {exc}) -> dense")
+        return dense()
 
-    return override
+
+def _sparse_ffn_call(block, x, h, transformer_options):
+    """block 级 FFN token 稀疏：video 段按 block 输入范数 top-keep%，cond 恒全量。
+
+    x = block 输入（attn 残差后），h = norm2 输出（FFN 输入）。
+    跳过的 token 输出 0 -> _mod_gate(gate*0=0) / add_ 残差恒等，安全。
+    音频/文本在 cond 段（video 前）恒全量，音频安全线不受影响。
+    """
+    params = getattr(block, "_bsai_veda_params", None)
+    if params is None or not params.get("enabled", False):
+        return block.mlp(h)
+    if not params.get("ffn_sparse", False):
+        return block.mlp(h)
+    layout = transformer_options.get("minimax_h3_layout")
+    span = _video_span(layout) if layout is not None else None
+    if span is None:
+        return block.mlp(h)
+    v0, v1 = span
+    N = h.shape[0]
+    if v1 > N or v0 >= N or (v1 - v0) < 128:
+        return block.mlp(h)
+    keep_frac = params["ffn_keep_frac"]
+    v_len = v1 - v0
+    keep = max(1, int(round(v_len * keep_frac)))
+    mask = torch.ones(N, dtype=torch.bool, device=h.device)
+    if keep < v_len:
+        imp = x.float().pow(2).mean(-1).sqrt()       # [N] 残差流范数
+        vals = imp[v0:v1]
+        thr = vals.topk(keep).values.min()
+        mask[v0:v1] = vals >= thr
+    out = torch.zeros_like(h)
+    if bool(mask.any()):
+        # 手动 swiglu：fc1 -> chunk(gate,up) -> silu(gate)*up -> fc2。
+        # 不依赖 comfy.ops.linear_input_act 的 fused kernel（CPU 上静默返回 0，
+        # 且对 gather 子集输入行为不可靠）；标准算子 CPU/GPU 均正确、数值等价。
+        xs = h[mask]
+        h1 = block.mlp.fc1(xs)
+        g, u = h1.chunk(2, dim=-1)
+        out[mask] = block.mlp.fc2(F.silu(g) * u)
+    return out
+
+
+def _h3_ditblock_forward(self, x, t_emb, mod_segments, rope_freqs,
+                         transformer_options=None, attention=None):
+    """替换 DiTBlock.forward：逐行复刻原逻辑，FFN 调用点做 token 稀疏。"""
+    if transformer_options is None:
+        transformer_options = {}
+    from comfy.ldm.minimax.model import _mod_scale_shift, _mod_gate
+    attention = self.attn if attention is None else attention
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+    h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
+    x = _mod_gate(x, gate_msa, attention(h, rope_freqs=rope_freqs,
+                                         transformer_options=transformer_options),
+                  mod_segments)
+    h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
+    h2 = _sparse_ffn_call(self, x, h, transformer_options)
+    return _mod_gate(x, gate_mlp, h2, mod_segments)
+
+
+def _h3_refinerblock_forward(self, x, transformer_options=None):
+    """替换 RefinerBlock.forward：FFN 调用点做 token 稀疏。"""
+    if transformer_options is None:
+        transformer_options = {}
+    from comfy.ldm.minimax.model import _mod_scale_shift, _mod_gate
+    x = self.attn(self.norm1(x), transformer_options=transformer_options).add_(x)
+    h = self.norm2(x)
+    h2 = _sparse_ffn_call(self, x, h, transformer_options)
+    return h2.add_(x)
+
 
 
 # ---------------------------------------------------------------------------
-# 顶层应用（由节点调用）
+# 安装 / 卸载 patch
 # ---------------------------------------------------------------------------
 
-def apply_veda(model, *, enabled, keep_percent, min_tokens, start_percent,
-               end_percent, sink_conditioning, head_tiling, tripool_mode,
-               scorer_weights, aspect, force_dims, verbose,
-               compose_with_foreign_patches=True):
+def _is_h3_attention(module):
+    cls = type(module)
+    return cls.__name__ == "Attention" and cls.__module__ == "comfy.ldm.minimax.model"
+
+
+def _install_h3_attn_patch(diffusion, params):
+    """实例级 monkey-patch H3 Attention.forward + DiTBlock/RefinerBlock.forward（幂等）。
+
+    同一 diffusion 对象重复 apply 时只更新参数，不重复包裹。
+    """
+    patched = 0
+    for name, module in diffusion.named_modules():
+        cls = type(module)
+        if cls.__name__ == "Attention" and cls.__module__ == "comfy.ldm.minimax.model":
+            if getattr(module, "_bsai_orig_forward", None) is None:
+                module._bsai_orig_forward = module.forward
+                module.forward = types.MethodType(_h3_attn_forward, module)
+            module._bsai_veda_params = params
+            patched += 1
+        elif cls.__name__ in ("DiTBlock", "RefinerBlock") \
+                and cls.__module__ == "comfy.ldm.minimax.model":
+            if getattr(module, "_bsai_orig_forward", None) is None:
+                module._bsai_orig_forward = module.forward
+                module.forward = types.MethodType(
+                    _h3_ditblock_forward if cls.__name__ == "DiTBlock"
+                    else _h3_refinerblock_forward, module)
+            module._bsai_veda_params = params
+            patched += 1
+    if patched == 0:
+        raise RuntimeError(
+            "[BSAI VedaSparse v3.4] 未找到任何 H3 Attention/DiTBlock 模块 "
+            f"({type(diffusion).__name__})；确认是 MiniMax-H3 diffusion model。")
+    logging.info(f"[BSAI VedaSparse v3.4] H3 Attention/Block.forward patched: {patched} 实例")
+    return patched
+
+
+def _unpatch_h3_attn(diffusion):
+    for _, module in diffusion.named_modules():
+        if not _is_h3_attention(module):
+            continue
+        orig = getattr(module, "_bsai_orig_forward", None)
+        if orig is not None:
+            module.forward = orig
+            module._bsai_orig_forward = None
+        module._bsai_veda_params = None
+
+
+# ---------------------------------------------------------------------------
+# 顶层应用
+# ---------------------------------------------------------------------------
+
+def apply_veda(model, *, enabled, keep_percent, min_tokens,
+               start_percent=0.5, end_percent=1.0,
+               sink_conditioning="exact_kv_and_rows", head_tiling=None,
+               tripool_mode="triplet", scorer_weights=None, aspect="16:9",
+               force_dims=None, verbose=False, vram_budget_gb=5,
+               max_sparse_tokens=16384, ffn_sparse=False, ffn_keep_percent=60.0):
     if not enabled:
-        logging.info("[BSAI VedaSparse] disabled -> passthrough")
+        logging.info("[BSAI VedaSparse v3.4] enabled=False -> passthrough")
         return model
 
     m = model.clone()
-    diffusion_model = m.get_model_object("diffusion_model")
-    if not (hasattr(diffusion_model, "rope_freqs") and hasattr(diffusion_model, "_forward")):
+    diffusion = m.get_model_object("diffusion_model")
+    if not (hasattr(diffusion, "rope_freqs") and hasattr(diffusion, "blocks")):
         raise RuntimeError(
-            "BSAI VedaSparse expects a MiniMax-H3 diffusion model; got "
-            f"{type(diffusion_model).__name__}.")
+            "BSAI VedaSparse v3.4 expects a MiniMax-H3 diffusion model; got "
+            f"{type(diffusion).__name__}.")
 
-    install_h3_span(diffusion_model)
     ms = m.get_model_object("model_sampling")
     sigma_start = float(ms.percent_to_sigma(start_percent))
     sigma_end = float(ms.percent_to_sigma(end_percent))
     keep_frac = max(0.005, min(1.0, keep_percent / 100.0))
 
-    # 蒸馏评分器（可选）
-    scorer = None
-    if scorer_weights is not None and isinstance(scorer_weights, dict) and scorer_weights:
-        try:
-            scorer = _DistilledScorer(scorer_weights, heads=64, d_head=128)
-            logging.info("[BSAI VedaSparse] distilled scorer loaded "
-                         f"({len(scorer_weights)} tensors)")
-        except Exception as exc:
-            logging.warning(f"[BSAI VedaSparse] scorer load failed ({exc}); "
-                            "heuristic TripPool scoring")
-            scorer = None
-
-    previous = m.model_options["transformer_options"].get("optimized_attention_override")
-    if previous is not None:
-        logging.info("[BSAI VedaSparse] chaining onto an existing attention override")
-
-    if compose_with_foreign_patches:
-        _install_compose_hooks(diffusion_model, "attn")
-
-    m.model_options["transformer_options"]["optimized_attention_override"] = \
-        make_veda_override(keep_frac=keep_frac, min_tokens=min_tokens,
-                           sigma_start=sigma_start, sigma_end=sigma_end,
-                           sink_conditioning=sink_conditioning,
-                           head_tilings=head_tiling, tripool_mode=tripool_mode,
-                           scorer=scorer, latent_dims=None, aspect=aspect,
-                           force_dims=force_dims, verbose=verbose, previous=previous)
-    m.model_options["transformer_options"]["bsai_vedasparse"] = {
-        "keep_percent": keep_percent, "min_tokens": min_tokens,
-        "sink": sink_conditioning, "tiling": list(head_tiling),
+    params = {
+        "enabled": True,
+        "keep_frac": keep_frac,
+        "min_tokens": int(min_tokens),
+        "sigma_start": sigma_start,
+        "sigma_end": sigma_end,
+        "sink": sink_conditioning,
         "tripool": tripool_mode,
-        "scorer": "distilled" if scorer is not None else "heuristic",
-        "sigma_start": sigma_start, "sigma_end": sigma_end}
+        "verbose": bool(verbose),
+        "max_sparse_tokens": int(max_sparse_tokens),
+        "ffn_sparse": bool(ffn_sparse),
+        "ffn_keep_frac": max(0.1, min(1.0, ffn_keep_percent / 100.0)),
+    }
+    _install_h3_attn_patch(diffusion, params)
+
+    m.model_options["transformer_options"]["bsai_vedasparse_v34"] = {
+        "keep_percent": keep_percent, "min_tokens": min_tokens,
+        "tripool": tripool_mode, "sigma_window": [sigma_end, sigma_start],
+        "sink": sink_conditioning,
+        "triton_available": _TRITON_SPARSE_AVAILABLE,
+        "max_sparse_tokens": int(max_sparse_tokens),
+        "ffn_sparse": bool(ffn_sparse),
+        "ffn_keep_percent": ffn_keep_percent,
+        "patched": True,
+    }
     reset_veda_stats()
-    logging.info(f"[BSAI VedaSparse] applied: keep={keep_percent}% "
-                 f"sink={sink_conditioning} tiling={head_tiling} "
-                 f"tripool={tripool_mode} scorer={'distilled' if scorer else 'heuristic'}")
+    logging.info(
+        f"[BSAI VedaSparse v3.4] applied (monkey-patch): keep={keep_percent}% "
+        f"tripool={tripool_mode} triton={_TRITON_SPARSE_AVAILABLE} "
+        f"sigma_window=[{sigma_end:.3f}, {sigma_start:.3f}] "
+        f"sink={sink_conditioning} max_sparse_tokens={max_sparse_tokens} "
+        f"ffn_sparse={ffn_sparse} ffn_keep={ffn_keep_percent}%")
     return m
 
 
-# ---------------------------------------------------------------------------
-# 与外部 attention object-patch 的兼容（同 FastH3 思路，独立实现）
-# ---------------------------------------------------------------------------
-
-_COMPOSE_HOOKED = set()
+def veda_stats():
+    return dict(_STATS)
 
 
-def _compose_module_patch(module, patched_forward):
-    stock = type(module).forward
-
-    def forward(*args, **kwargs):
-        options = kwargs.get("transformer_options")
-        if not isinstance(options, dict):
-            options = next((a for a in args
-                            if isinstance(a, dict) and "bsai_vedasparse" in a), {})
-        gate = options.get("bsai_vedasparse")
-        x = args[0] if args else None
-        tensor = x[0] if isinstance(x, list) and len(x) == 1 and torch.is_tensor(x[0]) else x
-        take = gate is not None and torch.is_tensor(tensor) and tensor.device.type == "cuda"
-        if take:
-            tokens = tensor.shape[0] if tensor.ndim == 2 else tensor.shape[1]
-            take = tokens >= gate.get("min_tokens", 0)
-        if take:
-            sigmas = options.get("sigmas")
-            if sigmas is not None:
-                sigma = float(sigmas[0])
-                take = not (gate.get("sigma_start") is not None and sigma > gate["sigma_start"]) \
-                       and not (gate.get("sigma_end") is not None and sigma < gate["sigma_end"])
-        if take:
-            if tensor is not x:
-                x.clear()
-                args = (tensor,) + args[1:]
-            return stock(module, *args, **kwargs)
-        return patched_forward(*args, **kwargs)
-
-    forward._bsai_veda_composed = True
-    return forward
-
-
-def _install_compose_hooks(model, attn_attr):
-    if id(model) in _COMPOSE_HOOKED:
-        return
-
-    def pre_hook(block, args):
-        attn = getattr(block, attn_attr, None)
-        if attn is None:
-            return None
-        fwd = attn.__dict__.get("forward")
-        if fwd is None or getattr(fwd, "_bsai_veda_composed", False):
-            return None
-        if getattr(fwd, "_uses_optimized_attention", False):
-            return None
-        if getattr(fwd, "__func__", None) is type(attn).forward:
-            return None
-        attn.forward = _compose_module_patch(attn, fwd)
-        _log_once(("composed", attn_attr),
-                  f"composing with a patched {attn_attr}.forward; VedaSparse takes "
-                  "eligible self-attention calls, the patch keeps the rest")
-        return None
-
-    for block in model.blocks:
-        block.register_forward_pre_hook(pre_hook)
-    _COMPOSE_HOOKED.add(id(model))
+def reset_veda_stats():
+    for k in _STATS:
+        _STATS[k] = 0
+    _SEEN.clear()
