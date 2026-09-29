@@ -143,7 +143,7 @@ UNETLoader (H3) ──▶ LoraLoaderModelOnly (Turbo 4步) ──▶ BSAIVedaSpa
 
 ## 🧩 五、示例工作流 / Example Workflow
 
-**`example_workflows/BSAI VedaSparse · 蒸馏稀疏注意力 H3多合一示例工作流 v1.0.json`** —— H3 多合一正式工作流（文生视频 / 图生视频 / 参考生视频 三合一，v3.4 定稿基线）。
+**`example_workflows/BSAI VedaSparse · 蒸馏稀疏注意力 H3多合一示例工作流 v1.0 - 固定seed验证.json`** —— 唯一正式示例工作流（H3 多合一：文生视频 / 图生视频 / 参考生视频，v3.4 定稿 + 固定 seed 945967344952729，本机验收通过基线）。
 
 ### 结构 / Structure
 
