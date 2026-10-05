@@ -40,6 +40,15 @@
 | **override_priority 让路** | 新参数 `override_priority`：`auto`（默认，检测到外部 override 即让路 dense，由官方 Veda 接管，避免双重稀疏叠加）/ `veda34`（强制 v3.4 优先，忽略外部 override）/ `official`（总是让路）。三种模式均可与官方 Veda 共存，**不再互斥** |
 | **实测（RTX 5090 Laptop 24GB · 8 步 Turbo）** | v6.1 工作流链式接入官方 Veda（90% 稀疏）→ FastH3 VSA（兜底）→ 原生：`Attention computed 25.9%（跳过 74.1%）`，400 次调用全稀疏，8 步 2:30 完成；Veda 拒绝的调用自动回落 FastH3，零冲突 |
 
+### v3.4.2 vendored 官方 Veda-on-ComfyUI（pull-and-go）/ v3.4.2 Vendored Official Veda (Pull-and-Go)
+
+| 升级点 / Upgrade | 说明 / Description |
+|---|---|
+| **仓库自带官方节点** | 仓库新增 `official_veda_vendor/`——官方 [Veda-on-ComfyUI](https://github.com/veda-sparse/Veda-on-ComfyUI)（MIT License）的精简副本。**git pull / clone 本仓库后，`VedaSparseAttention` 节点自动可用，打开 v6.1 等引用官方节点的工作流不再报「缺失节点包 / missing node package」** |
+| **自动去重** | 检测到 `custom_nodes/Veda-on-ComfyUI` 官方插件已安装时自动跳过 vendored 注册（不重复注册）；未安装时自动合并注册——C 盘（官方已装）与 G 盘/其他电脑（未装）行为均正确 |
+| **predictor 下载指引** | 预测器权重（275MB）需放在 `ComfyUI/models/veda/`：`minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`。下载（hf-mirror）：`https://hf-mirror.com/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/resolve/main/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`；SHA-256 `2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a` |
+| **依赖** | vendored 官方节点运行需 `triton-windows>=3.0`（Windows，与官方插件一致）；缺失时节点注册不受影响，运行时 fallback 到 eager（详见官方文档） |
+
 ### 实测加速 / Benchmarks（论文环境：3×RTX4090，8 步去噪 + TabLoRA）
 
 | 视频时长 / Clip | 端到端加速 / E2E | 注意力加速 / Attention |
@@ -77,7 +86,7 @@ git clone https://github.com/xm6018924/BSAI-ComfyUI-VedaSparse.git
 
 将 `BSAI-ComfyUI-VedaSparse` 文件夹放入 `ComfyUI/custom_nodes/`，重启 ComfyUI。
 
-**依赖 / Dependencies**：仅需 ComfyUI 内置环境（torch、`comfy.utils`），无需额外 pip 包。需含 MiniMax-H3 模型支持的 ComfyUI 版本（≥ 0.33.0）。
+**依赖 / Dependencies**：仅需 ComfyUI 内置环境（torch、`comfy.utils`），无需额外 pip 包。需含 MiniMax-H3 模型支持的 ComfyUI 版本（≥ 0.33.0）。 使用 vendored 官方 Veda 节点时另需 `triton-windows>=3.0`（Windows）。
 
 ---
 
@@ -203,6 +212,7 @@ UNETLoader (H3) ──▶ LoraLoaderModelOnly (Turbo 4步) ──▶ BSAIVedaSpa
 - ComfyUI ≥ 0.33.0（含 MiniMax-H3 支持）。
 - v3.4 monkey-patch 与 FastH3 / TaoMate / T8 块缓存 / UniBlockSwap 等外部插件链式兼容（独立 patch attention 段，不冲突）。
 - **官方 Veda-on-ComfyUI 全兼容（v3.4.1）**：不再互斥。官方节点通过 `optimized_attention_override` 注入稀疏，v3.4 检测到即让路（`override_priority=auto` 默认），Veda 拒绝的调用回落本引擎，最后原生兜底——三阶链式协作。
+- **vendored 官方节点（v3.4.2）**：官方插件未装时由仓库自带副本自动注册 `VedaSparseAttention`（pull-and-go），官方已装时跳过——任何机器 pull 后工作流均不报缺节点包。
 - 非 H3 扩散模型明确报错并 dense 回退，不影响其他工作流。
 
 ---

@@ -31,8 +31,55 @@ v3.2 真正最小化重写：
 直通，但保留位置以便后续重新启用 sparse。
 
 安装：把本目录放到 ComfyUI/custom_nodes/BSAI-ComfyUI-VedaSparse，重启 ComfyUI。
+
+v3.4.2 vendored 官方 Veda-on-ComfyUI（pull-and-go）
+===================================================
+仓库自带的 `official_veda_vendor/` 是官方 Veda-on-ComfyUI（MIT License,
+https://github.com/veda-sparse/Veda-on-ComfyUI）的精简副本。当
+`custom_nodes/Veda-on-ComfyUI` 官方插件**未安装**时，本插件自动把官方
+`VedaSparseAttention` 节点合并注册进 NODE_CLASS_MAPPINGS——因此 git pull /
+clone 本仓库后打开引用官方节点的 v6.1 等工作流**不再报缺失节点包**；
+官方插件已安装时自动跳过，避免重复注册。
+
+依赖：triton-windows>=3.0（与官方插件一致）；预测器权重放
+`ComfyUI/models/veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`
+（hf-mirror: https://hf-mirror.com/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/resolve/main/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors）
 """
+
+import logging
+import os
+import sys as _sys
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+
+_OFFICIAL_VEDA_VENDORED = False
+
+
+def _maybe_vendor_official_veda():
+    """注册 vendored 官方 VedaSparseAttention（仅当官方插件未安装时）。"""
+    global _OFFICIAL_VEDA_VENDORED
+    _vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "official_veda_vendor")
+    if not os.path.isdir(_vendor):
+        return
+    try:
+        # 官方插件已安装（custom_nodes/Veda-on-ComfyUI 存在）→ 跳过，避免重复注册
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if os.path.isdir(os.path.join(_root, "Veda-on-ComfyUI")):
+            logging.info("[BSAI VedaSparse] 官方 Veda-on-ComfyUI 已安装，跳过 vendored 注册")
+            return
+        _parent = os.path.dirname(_vendor)
+        if _parent not in _sys.path:
+            _sys.path.insert(0, _parent)
+        from official_veda_vendor.veda_comfy import nodes as _veda_official
+        _veda_official.register_model_folder()
+        NODE_CLASS_MAPPINGS["VedaSparseAttention"] = _veda_official.VedaSparseAttention
+        NODE_DISPLAY_NAME_MAPPINGS["VedaSparseAttention"] = "Veda Sparse Attention (MiniMax H3)"
+        _OFFICIAL_VEDA_VENDORED = True
+        logging.info("[BSAI VedaSparse] vendored 官方 VedaSparseAttention 已注册（pull-and-go）")
+    except Exception as e:  # noqa: BLE001 —— vendored 失败不阻塞本插件
+        logging.warning("[BSAI VedaSparse] vendored 官方 Veda 注册失败（%s）", e)
+
+
+_maybe_vendor_official_veda()
