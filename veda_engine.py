@@ -463,9 +463,12 @@ def _h3_attn_call(self, q, k, v, transformer_options,
 
     def dense():
         _STATS["dense"] += 1
-        # 复刻 wrap_attn 的 preferred_attention 语义（去掉 override 键防递归）
+        # BSAI v3.4.1 全兼容: 不再移除 optimized_attention_override——
+        # 官方 Veda-on-ComfyUI 节点通过该键注入 attention override，
+        # 之前无条件 pop 会让官方 Veda 永远不生效（互斥根源）。
+        # v3.4 是 Attention.forward 级 monkey-patch，官方是调用点级 override，
+        # 透传给 override 链不会递归回本 forward，安全。
         to = dict(transformer_options)
-        to.pop("optimized_attention_override", None)
         return optimized_attention(
             q, k, v, self.heads, preferred_attention=self.comfy_attention,
             mask=None, skip_reshape=True, transformer_options=to)
@@ -473,7 +476,6 @@ def _h3_attn_call(self, q, k, v, transformer_options,
     def dense_tensors(qs, ks, vs):
         _STATS["dense"] += 1
         to = dict(transformer_options)
-        to.pop("optimized_attention_override", None)
         return optimized_attention(
             qs, ks, vs, self.heads, preferred_attention=self.comfy_attention,
             mask=None, skip_reshape=True, transformer_options=to)
@@ -481,6 +483,21 @@ def _h3_attn_call(self, q, k, v, transformer_options,
     if params is None or not params.get("enabled", False):
         return dense()
     if _FALLBACK_TO_DENSE:
+        return dense()
+
+    # BSAI v3.4.1 全兼容: 外部 attention override（官方 Veda-on-ComfyUI 等）
+    # 存在时默认让路，由 override 链接管，避免双重稀疏叠加。
+    # override_priority: auto(默认, 有外部 override 就让路) /
+    #                    veda34(强制 v3.4 优先, 忽略外部 override) /
+    #                    official(总是让路给外部 override)。
+    priority = params.get("override_priority", "auto")
+    if priority == "official" or (
+            priority == "auto"
+            and transformer_options.get("optimized_attention_override") is not None):
+        _STATS["dense"] += 1
+        if params.get("verbose"):
+            logging.info("[BSAI VedaSparse v3.4] 检测到外部 attention override，"
+                         "v3.4 让路 -> dense（官方 Veda 接管）")
         return dense()
 
     try:
@@ -685,7 +702,8 @@ def apply_veda(model, *, enabled, keep_percent, min_tokens,
                sink_conditioning="exact_kv_and_rows", head_tiling=None,
                tripool_mode="triplet", scorer_weights=None, aspect="16:9",
                force_dims=None, verbose=False, vram_budget_gb=5,
-               max_sparse_tokens=16384, ffn_sparse=False, ffn_keep_percent=60.0):
+               max_sparse_tokens=16384, ffn_sparse=False, ffn_keep_percent=60.0,
+               override_priority="auto"):
     if not enabled:
         logging.info("[BSAI VedaSparse v3.4] enabled=False -> passthrough")
         return model
@@ -714,6 +732,7 @@ def apply_veda(model, *, enabled, keep_percent, min_tokens,
         "max_sparse_tokens": int(max_sparse_tokens),
         "ffn_sparse": bool(ffn_sparse),
         "ffn_keep_frac": max(0.1, min(1.0, ffn_keep_percent / 100.0)),
+        "override_priority": override_priority,
     }
     _install_h3_attn_patch(diffusion, params)
 

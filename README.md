@@ -32,6 +32,14 @@
 | **FFN 稀疏默认关闭** | `ffn_sparse=False`——FFN 硬跳稀疏曾在低步数下造成画面噪点（已实测复现并否决） |
 | **sink = exact_kv_and_rows** | 文本/音频/参考行 key 与 row 均保持精确，音频安全 |
 
+### v3.4.1 官方 Veda 全兼容（不互斥）/ v3.4.1 Official Veda Coexistence
+
+| 升级点 / Upgrade | 说明 / Description |
+|---|---|
+| **dense 透传 override** | `dense()` / `dense_tensors()` 不再移除 `optimized_attention_override`——官方 Veda-on-ComfyUI 节点正是通过该键注入 attention override；旧版无条件 pop 会吞掉官方 Veda（互斥根源）。v3.4 是 `Attention.forward` 级 monkey-patch，官方是调用点级 override，透传不会递归回本 forward，安全 |
+| **override_priority 让路** | 新参数 `override_priority`：`auto`（默认，检测到外部 override 即让路 dense，由官方 Veda 接管，避免双重稀疏叠加）/ `veda34`（强制 v3.4 优先，忽略外部 override）/ `official`（总是让路）。三种模式均可与官方 Veda 共存，**不再互斥** |
+| **实测（RTX 5090 Laptop 24GB · 8 步 Turbo）** | v6.1 工作流链式接入官方 Veda（90% 稀疏）→ FastH3 VSA（兜底）→ 原生：`Attention computed 25.9%（跳过 74.1%）`，400 次调用全稀疏，8 步 2:30 完成；Veda 拒绝的调用自动回落 FastH3，零冲突 |
+
 ### 实测加速 / Benchmarks（论文环境：3×RTX4090，8 步去噪 + TabLoRA）
 
 | 视频时长 / Clip | 端到端加速 / E2E | 注意力加速 / Attention |
@@ -95,6 +103,7 @@ git clone https://github.com/xm6018924/BSAI-ComfyUI-VedaSparse.git
 | `ffn_sparse` | false | FFN 稀疏总开关——**默认关**（硬跳 FFN 曾致画面噪点，已否决） |
 | `ffn_keep` | 60.0 | FFN 稀疏保留比例（仅 ffn_sparse=true 时生效） |
 | `sink_conditioning` | exact_kv_and_rows | 文本/音频/参考行保持精确：exact（推荐）/ off |
+| `override_priority` | auto | 与外部 attention override（官方 Veda-on-ComfyUI）协作：auto=检测到外部 override 时 v3.4 让路（官方接管）/ veda34=强制 v3.4 优先（忽略外部 override）/ official=总是让路。三种模式均可共存，不互斥 |
 | `verbose` | false | 详细日志 |
 
 ### BSAIVedaSparseStats
@@ -193,6 +202,7 @@ UNETLoader (H3) ──▶ LoraLoaderModelOnly (Turbo 4步) ──▶ BSAIVedaSpa
 
 - ComfyUI ≥ 0.33.0（含 MiniMax-H3 支持）。
 - v3.4 monkey-patch 与 FastH3 / TaoMate / T8 块缓存 / UniBlockSwap 等外部插件链式兼容（独立 patch attention 段，不冲突）。
+- **官方 Veda-on-ComfyUI 全兼容（v3.4.1）**：不再互斥。官方节点通过 `optimized_attention_override` 注入稀疏，v3.4 检测到即让路（`override_priority=auto` 默认），Veda 拒绝的调用回落本引擎，最后原生兜底——三阶链式协作。
 - 非 H3 扩散模型明确报错并 dense 回退，不影响其他工作流。
 
 ---

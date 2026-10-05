@@ -176,6 +176,12 @@ class BSAIVedaSparsePatch:
             "sink_conditioning": (SINK_MODES, {
                 "default": SINK_EXACT,
                 "tooltip": "conditioning 行（text/audio）保持精确。"}),
+            "override_priority": (("auto", "veda34", "official"), {
+                "default": "auto",
+                "tooltip": "与外部 attention override（官方 Veda-on-ComfyUI）的协作："
+                           "auto=检测到外部 override 时 v3.4 让路，由官方 Veda 接管"
+                           "（避免双重稀疏）；veda34=强制 v3.4 优先（忽略外部 override）；"
+                           "official=总是让路。三种模式均不冲突、可共存。"}),
             "verbose": ("BOOLEAN", {
                 "default": False,
                 "tooltip": "输出详细日志。"}),
@@ -189,7 +195,7 @@ class BSAIVedaSparsePatch:
     def apply_veda(self, model, enabled, keep_percent, head_tiling,
                    custom_tiling, tripool_mode, scorer_weights, aspect,
                    force_dims, start_percent, end_percent, min_tokens,
-                   sink_conditioning, verbose):
+                   sink_conditioning, override_priority, verbose):
         tilings = _parse_tiling(head_tiling, custom_tiling)
         dims = _parse_force_dims(force_dims)
         sd = _load_scorer(scorer_weights)
@@ -199,7 +205,8 @@ class BSAIVedaSparsePatch:
             end_percent=end_percent, sink_conditioning=sink_conditioning,
             head_tiling=tilings, tripool_mode=_TRIPOOL_VALUES[tripool_mode],
             scorer_weights=sd, aspect=aspect if aspect != "auto" else "16:9",
-            force_dims=dims, verbose=verbose),)
+            force_dims=dims, verbose=verbose,
+            override_priority=override_priority),)
 
 
 class BSAIVedaSparseStats:
