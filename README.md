@@ -48,6 +48,8 @@
 | **自动去重** | 检测到 `custom_nodes/Veda-on-ComfyUI` 官方插件已安装时自动跳过 vendored 注册（不重复注册）；未安装时自动合并注册——C 盘（官方已装）与 G 盘/其他电脑（未装）行为均正确 |
 | **predictor 下载指引** | 预测器权重（275MB）需放在 `ComfyUI/models/veda/`：`minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`。下载（hf-mirror）：`https://hf-mirror.com/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/resolve/main/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`；SHA-256 `2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a` |
 | **依赖** | vendored 官方节点运行需 `triton-windows>=3.0`（Windows，与官方插件一致）；缺失时节点注册不受影响，运行时 fallback 到 eager（详见官方文档） |
+| **R2VA 预测器（视频确认已发布，本仓库已收录）** | 官方已发布 R2VA 专用预测器（参考视频/图片生视频：每查询 32 参考块 + 32 视频块，文本/VLM/音频 cond 恒 dense），仓库 `https://huggingface.co/Veda-Sparse/Minimax-H3-R2VA-Veda-Preview`（来源：BV1Z4p568EzU）。vendored 官方 `KNOWN_PREDICTORS` 已补 R2VA 条目（文件名 `minimax_h3_r2va_veda_preview_fp8.safetensors`，发布 2026-10-08）。下载（hf-mirror）：`https://hf-mirror.com/Veda-Sparse/Minimax-H3-R2VA-Veda-Preview/resolve/main/minimax_h3_r2va_veda_preview_fp8.safetensors`；SHA-256 `23edace948693772be33d5cc945d302d2b037a29bd44bd57071bfbdd8b02517d` |
+| **R2VA 新元数据格式（bundle 解析已同步官方）** | R2VA 预览文件不再写旧的 `keep_ratio` 键，改用 `target_budget_kind/value` + `ref_budget_kind/value`（R2VA = 32 tiles × 2 流）。官方 Veda-on-ComfyUI 已发布对应解析（`core/bundle.py` 的 `_budget()`，旧 `keep_ratio` 格式自动回退），本仓库 vendored 已同步官方新版 `core/bundle.py`——R2VA（trained 32 tiles）与 T2VA（trained 90% sparse）两种文件均可直接加载，不再报 `incomplete metadata ('keep_ratio')`。官方 `KNOWN_PREDICTORS` 条目仍待收录，本仓库已先行收录 |
 
 ### 实测加速 / Benchmarks（论文环境：3×RTX4090，8 步去噪 + TabLoRA）
 
