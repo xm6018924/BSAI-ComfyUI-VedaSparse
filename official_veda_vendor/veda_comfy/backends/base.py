@@ -29,6 +29,15 @@ class BackendUnavailable(RuntimeError):
     """The backend cannot run here; the message is shown to the user."""
 
 
+class MissingDependency(BackendUnavailable):
+    """A package the backend needs is not installed.
+
+    The user can fix this alone, so the message must be the fix: what to
+    install, with which command, and that ComfyUI needs a restart. The
+    node shows it as is and does not ask for an issue.
+    """
+
+
 class Backend(abc.ABC):
     """Block-sparse attention on tile-ordered tensors.
 
@@ -69,6 +78,16 @@ class Backend(abc.ABC):
 
     def warmup_note(self) -> str | None:
         """What the first call does that takes a while, if anything."""
+        return None
+
+    def explain_failure(self, error: BaseException) -> str | None:
+        """How the user can fix `error`, if this backend recognises it.
+
+        A backend that reached its self-test is right for the GPU, so a
+        failure here is almost always the toolchain around it rather than
+        the hardware; only the backend knows what its own build needs.
+        """
+        del error
         return None
 
 

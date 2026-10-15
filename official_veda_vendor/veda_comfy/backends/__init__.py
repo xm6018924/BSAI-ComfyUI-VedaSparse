@@ -1,8 +1,9 @@
 """Backend registry: which kernel runs on which device.
 
     CUDA sm80 and up    triton-int8
+    ROCm gfx11, gfx12   triton-int8
     Apple MPS           mlx
-    anything else       nothing (the node runs the model's own attention)
+    anything else       nothing (the node stops with an error)
 
 One kernel per device family, no fallback chain and nothing for the user
 to pick. Earlier there were five: four FA4 CuTe backends (one per SM
@@ -15,7 +16,8 @@ fallbacks silently hands a user a slower or less accurate kernel than the
 one they think they are running. See docs/features/int8_kernel.md.
 
 Backend modules are imported lazily and only here, so a missing Triton
-costs one line in the report, never the node.
+is reported (with the install command) instead of breaking the import of
+the node itself.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from .. import hardware
 
 _MODULES = {'triton-int8': 'triton_int8', 'mlx': 'mlx_gather'}
 _MIN_CC = (8, 0)
+# RDNA3 and RDNA4, where Triton lowers the kernel's int8 dot to WMMA.
+_ROCM_ARCHS = ('gfx11', 'gfx12')
 
 
 def _load(name: str, info: hardware.DeviceInfo) -> base.Backend:
@@ -48,11 +52,24 @@ class Resolution:
         device: The device info.
         backend: The backend to use, None if nothing works (run dense).
         attempts: (candidate, 'ok' or why it was skipped), in order.
+        hints: What the user can do about the failures, from the backends
+            that recognised their own (`Backend.explain_failure`).
+        error: The last failure itself, for the traceback in an issue
+            report; None when nothing failed.
     """
 
     device: hardware.DeviceInfo
     backend: base.Backend | None
     attempts: list[tuple[str, str]]
+    hints: list[str] = dataclasses.field(default_factory=list)
+    error: BaseException | None = None
+
+    @property
+    def has_candidate(self) -> bool:
+        """Whether a kernel covers this device at all. False means the
+        hardware is out of scope; True with `backend` None means the
+        kernel that covers it did not start here."""
+        return bool(self.attempts)
 
     def report(self) -> str:
         return '; '.join(f'{name}: {status}' for name, status in self.attempts)
@@ -60,11 +77,28 @@ class Resolution:
 
 def candidates(info: hardware.DeviceInfo) -> list[str]:
     """The backend to try on a device; empty if none applies."""
-    if info.kind == 'cuda' and info.family != 'rocm' and info.cc:
+    if info.kind == 'cuda' and info.subtype == 'rocm':
+        return ['triton-int8'] if info.family.startswith(_ROCM_ARCHS) else []
+    if info.kind == 'cuda' and info.cc:
         return ['triton-int8'] if info.cc >= _MIN_CC else []
     if info.kind == 'mps':
         return ['mlx']
     return []
+
+
+def _add_hint(hints: list[str], backend: base.Backend | None,
+              error: BaseException) -> None:
+    """Appends the backend's advice for `error`, if it has any."""
+    if backend is None:
+        return
+    try:
+        hint = backend.explain_failure(error)
+    except Exception:  # advice must never be the thing that breaks
+        logging.warning('Veda: %s could not explain a failure',
+                        backend.name, exc_info=True)
+        return
+    if hint and hint not in hints:
+        hints.append(hint)
 
 
 _LOCK = threading.RLock()
@@ -86,8 +120,10 @@ def resolve(device: torch.device,
         if key in _RESOLVED:
             return _RESOLVED[key]
         attempts: list[tuple[str, str]] = []
-        chosen = None
+        hints: list[str] = []
+        chosen = failure = None
         for name in candidates(info):
+            backend = None
             try:
                 backend = _load(name, info)
                 note = backend.warmup_note()
@@ -96,33 +132,23 @@ def resolve(device: torch.device,
                 base.self_test(backend, device)
             except base.BackendUnavailable as error:
                 attempts.append((name, str(error)))
+                _add_hint(hints, backend, error)
+                failure = error
                 continue
-            except Exception as error:  # a broken backend must not crash
+            except Exception as error:  # reported by the caller, with context
                 logging.warning('Veda: backend %s failed to load', name,
                                 exc_info=True)
                 attempts.append((name, f'{type(error).__name__}: {error}'))
+                _add_hint(hints, backend, error)
+                failure = error
                 continue
             attempts.append((backend.name, 'ok'))
             chosen = backend
             break
-        resolution = Resolution(info, chosen, attempts)
+        resolution = Resolution(info, chosen, attempts, hints,
+                                None if chosen else failure)
         _RESOLVED[key] = resolution
         return resolution
-
-
-def probe(device: torch.device) -> list[tuple[str, str, str | None]]:
-    """(name, display name, error or None) for the device's backend,
-    without compiling or self-testing (cheap; for the status shown before
-    sampling)."""
-    info = hardware.describe(device)
-    out = []
-    for name in candidates(info):
-        try:
-            backend = _load(name, info)
-            out.append((backend.name, backend.display, None))
-        except Exception as error:  # report every failure the same way
-            out.append((name, name, str(error)))
-    return out
 
 
 def reset() -> None:

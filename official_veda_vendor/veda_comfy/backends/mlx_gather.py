@@ -139,8 +139,11 @@ def create(info, chunk_bytes: int | None = None) -> base.Backend:
     if info.kind not in ('mps', 'cpu') or info.os != 'darwin':
         raise base.BackendUnavailable('MLX runs on Apple silicon only')
     if importlib.util.find_spec('mlx') is None:
-        raise base.BackendUnavailable(
-            'MLX is not installed (pip install mlx with ComfyUI\'s python '
-            'for faster attention on Apple silicon)')
+        raise base.MissingDependency(
+            'MLX is not installed. Install it into the Python that runs '
+            'ComfyUI, then restart ComfyUI:\n'
+            '  python -m pip install mlx\n'
+            'MLX 没有安装。请用运行 ComfyUI 的那个 Python 执行 '
+            'python -m pip install mlx，然后重启 ComfyUI。')
     import mlx.core as mx  # pylint: disable=import-outside-toplevel
     return MlxGatherBackend(mx, chunk_bytes or DEFAULT_CHUNK_BYTES)

@@ -36,6 +36,13 @@ _CHUNK_SHARE = 8
 _MIN_CHUNK_BYTES = 128 * 2**20
 _MAX_CHUNK_BYTES = 1024 * 2**20
 _DEFAULT_CHUNK_BYTES = 256 * 2**20
+# Free memory alone is the wrong bound: on a GPU with room to spare the
+# chunk grows until Veda holds several GB that ComfyUI then cannot use to
+# stage weights (measured 3.24 GB peak against 0.64 GB for full attention,
+# RTX 5070, 1344x768 x 5.2 s). So the chunk is also kept to a share of the
+# layer's own output buffer, which scales with the problem and not with
+# the machine; the free-memory bound still applies on top for small GPUs.
+_WORKING_SET_SHARE = 6
 
 
 class Stats:
@@ -53,9 +60,24 @@ class Stats:
         self.video_pairs = 0
         self.work = None
         self.dense_work = 0.0
+        # Tiles kept per query row, accumulated on the device: the spread
+        # is what tells a stable selection from one that swings between
+        # neighbouring rows, which is what makes a video flicker.
+        self.row_min = None
+        self.row_max = None
+        self.row_sum = None
+        self.rows = 0
 
     def add(self, keep: torch.Tensor, layout: tiling.TileLayout) -> None:
         heads = keep.shape[0]
+        per_row = keep.sum(-1)
+        low, high, total = per_row.min(), per_row.max(), per_row.sum()
+        self.row_min = low if self.row_min is None else torch.minimum(
+            self.row_min, low)
+        self.row_max = high if self.row_max is None else torch.maximum(
+            self.row_max, high)
+        self.row_sum = total if self.row_sum is None else self.row_sum + total
+        self.rows += per_row.numel()
         kept = keep.sum()
         global_blocks = layout.n_global_tiles * (layout.n_tiles
                                                  + layout.n_video_tiles)
@@ -70,6 +92,13 @@ class Stats:
         if self.kept is None or not self.video_pairs:
             return None
         return float(self.kept) / self.video_pairs
+
+    def per_row(self) -> tuple[int, float, int] | None:
+        """(min, mean, max) key tiles kept per query row, or None."""
+        if self.row_sum is None or not self.rows:
+            return None
+        return (int(self.row_min), float(self.row_sum) / self.rows,
+                int(self.row_max))
 
     def compute_fraction(self) -> float | None:
         """Share of full-attention work done (all rows, all tokens)."""
@@ -216,7 +245,8 @@ class VedaEngine:
     @torch.no_grad()
     def attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                   layer: int, spec: h3_layout.LayoutSpec,
-                  plan: veda_plans.TilePlan) -> torch.Tensor:
+                  plan: veda_plans.TilePlan,
+                  head_chunks: int = 1) -> torch.Tensor:
         """Veda block-sparse attention of one layer.
 
         Args:
@@ -224,6 +254,11 @@ class VedaEngine:
             layer: DiT block index.
             spec: Layout spec of this sequence.
             plan: Tile plan to use (from plan_for()).
+            head_chunks: Least number of head groups to split the layer
+                into, from a node asking for lower peak memory (KJNodes'
+                Low VRAM attention). Without it the chunk size is only
+                bounded by free memory, which on a GPU with room to spare
+                means one or two large chunks.
 
         Returns:
             [S, H, D] contiguous, q's dtype.
@@ -233,17 +268,32 @@ class VedaEngine:
         dtype = q.dtype
         if dtype not in self.backend.dtypes:
             q, k, v = (t.to(self.backend.dtypes[0]) for t in (q, k, v))
+        chunks = 0
+        self.chunking['heads_per_chunk'] = 0
+        # Veda's own transient, measured rather than derived: the bytes
+        # torch holds at the peak of a chunk, counted from before the
+        # layer's output buffer so the number is everything this call
+        # adds. Two counter reads per chunk, no synchronization.
+        measuring = self.device.type == 'cuda'
+        base = torch.cuda.memory_allocated(self.device) if measuring else 0
         out = q.new_empty(seq_len + 1, heads, dim)
         proj_q, proj_k = self._weights(layer)
         chunk_bytes = self._chunk_bytes()
-        chunks = 0
         for group in plan.head_groups(layer, self.device):
             layout = self._tile_layout(spec, group.shape)
             blocks = selection.column_blocks(layout, self.generated,
                                              self.reference)
             per_head = layout.num_slots * dim * q.element_size()
             step = max(1, chunk_bytes // per_head)
-            self.chunking['heads_per_chunk'] = min(step, len(group.heads))
+            step = min(step, max(1, out.numel() * out.element_size()
+                                 // (per_head * _WORKING_SET_SHARE)))
+            if head_chunks > 1:
+                step = min(step, -(-heads // head_chunks))
+            # The widest group, not the last one: the groups of a layer
+            # differ in size and the widest is what has to fit.
+            self.chunking['heads_per_chunk'] = max(
+                self.chunking.get('heads_per_chunk', 0),
+                min(step, len(group.heads)))
             for heads_chunk in group.heads.split(step):
                 chunks += 1
                 with timer('gather'):
@@ -264,6 +314,10 @@ class VedaEngine:
                     v_t = tiling.gather_tiles(v, layout, heads_chunk)
                 with timer('attend'):
                     o_t = self.backend.attend(q_t, k_t, v_t, mask, layout)
+                if measuring:
+                    self.chunking['workspace_bytes'] = max(
+                        self.chunking.get('workspace_bytes', 0),
+                        torch.cuda.memory_allocated(self.device) - base)
                 del q_t, k_t, v_t, mask
                 with timer('scatter'):
                     tiling.scatter_tiles_(out, o_t, layout, heads_chunk)

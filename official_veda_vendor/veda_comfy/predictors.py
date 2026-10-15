@@ -71,12 +71,11 @@ KNOWN_PREDICTORS = {
                    '76573a',
             size=275415648),
         KnownPredictor(
-            filename='minimax_h3_r2va_veda_preview_fp8'
-                     '.safetensors',
+            filename='minimax_h3_r2va_veda_preview_fp8.safetensors',
             repo='Veda-Sparse/Minimax-H3-R2VA-Veda-Preview',
             revision='1598b407905b7c0af85aa0c13acdfa6f01ff2982',
-            sha256='23edace948693772be33d5cc945d302d2b037a29bd44bd57071bfbdd8b0'
-                   '2517d',
+            sha256='23edace948693772be33d5cc945d302d2b037a29bd44bd57071bfbdd8b'
+                   '02517d',
             size=275415752),
     ]
 }
@@ -91,4 +90,8 @@ def how_to_get(known: KnownPredictor, folder: str) -> str:
             'Veda-on-ComfyUI) and let ComfyUI download it from the missing '
             'models dialog, or download it by hand and restart ComfyUI:\n'
             f'  {known.url}\n'
-            f'and put it in {folder}')
+            f'and put it in {folder}\n'
+            f'打分器 {known.filename}（{known.megabytes} MB）不在 {folder} 里。'
+            '打开 Veda 模板（工作流 -> 浏览模板 -> Veda-on-ComfyUI），'
+            '在缺失模型对话框里一键下载；或者从上面的地址手动下载，'
+            '放进该目录后重启 ComfyUI。')

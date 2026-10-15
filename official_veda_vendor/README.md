@@ -27,12 +27,14 @@ MiniMax-H3 (T2VA, FL2VA and R2VA): one node, MODEL in and MODEL out.
   Turbo and style LoRAs, fine-tuned and quantized H3 checkpoints,
   first/last-frame and reference conditioning, and other block patches
   keep working.
-- **Safe by default.** Every kernel passes a self-test on the GPU before
-  it is used. Anything Veda cannot handle runs the model's own attention
-  and says so on the node, rather than producing a broken render.
+- **Never silently off.** Every kernel passes a self-test on the GPU
+  before it is used. When Veda cannot run, the prompt stops with the
+  reason instead of quietly rendering without acceleration: a missing
+  package or a node in the wrong place comes with the fix, anything else
+  with a ready-to-paste report for a GitHub issue.
 - **Nothing extra to install.** The sparse kernel ships with the node;
-  installing from the Comfy Registry pulls in Triton (NVIDIA, SM80 and
-  newer) or MLX (Apple silicon).
+  installing from the Comfy Registry pulls in Triton (NVIDIA SM80 and
+  newer, AMD RDNA3 / RDNA4 on ROCm) or MLX (Apple silicon).
 
 ## Installation
 
@@ -59,6 +61,14 @@ Do not combine it with ComfyUI's own "Model Sparse Attention" node on H3:
 that one replaces the attention blocks outright, so Veda would never be
 called. The node says so when it sees both.
 
+Other attention nodes can stay. Veda runs on top of "Patch Sage Attention
+KJ" (the calls it does not take go to sage), and KJNodes' "MiniMax H3 Low
+VRAM Attention" keeps working. A node that swaps out the whole H3
+attention, such as "MiniMax H3 Mem Eff Sage Attention Patch", must come
+*before* Veda: Veda then runs the sparse layers and leaves that node the
+full-attention ones, and says so on its node. Placed after Veda it would
+hide every call from Veda; the node warns about that too.
+
 ### Predictor
 
 The node does not download anything itself. The predictor (275 MB)
@@ -66,10 +76,13 @@ reaches `models/veda` one of two ways:
 
 * **From a template.** Open one of the Veda templates and ComfyUI offers
   the predictor in its missing-models dialog; one click fetches it.
-* **By hand.** Download
-  `minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors` from the
-  [predictor repository](https://huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview)
-  into `ComfyUI/models/veda/` and restart ComfyUI.
+* **By hand.** Download the predictor for your task into
+  `ComfyUI/models/veda/` and restart ComfyUI:
+  [T2VA / FL2VA](https://huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview)
+  (`minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`) or
+  [R2VA](https://huggingface.co/Veda-Sparse/Minimax-H3-R2VA-Veda-Preview)
+  (`minimax_h3_r2va_veda_preview_fp8.safetensors`), which is trained on
+  the reference task and used by the R2VA template.
 
 Any `.safetensors` in that folder appears in the `predictor` list, so a
 predictor trained elsewhere is selected the same way. If the selected
@@ -86,11 +99,14 @@ Attention computed: 10.9% of full attention (89.1% skipped)
 
 Before sampling the node names the kernel it will use and the sparsity;
 while sampling, the video size and the trained tile plan it matched; at
-the end, how much of full attention was actually computed. A line
-starting `Veda off` gives the reason Veda is not running, and `nearest
+the end, how much of full attention was actually computed. If Veda
+cannot run, the prompt stops with an error that says why; `nearest
 trained size: ...` on the tile plan line means the video is outside the
 trained set. `verbose` adds per-phase timing, call counts and predictor
 details.
+
+Warnings and errors come in English and Chinese, one after the other;
+the node's name and tooltips follow ComfyUI's interface language.
 
 ### Options
 
@@ -99,8 +115,8 @@ Only `model` and `predictor` are visible. The rest are advanced inputs
 
 | Input | Default | Description |
 |---|---|---|
-| `generated_sparsity` | `90%` | Sparsity of the generated video's attention. `90%` skips 90% of the key tiles each query tile could attend, which is the trained value; lower is closer to full attention and slower. A whole number such as `24` keeps exactly that many 128-token key tiles instead. |
-| `reference_sparsity` | `90%` | The same for references: first/last frames, guide frames, reference images and videos. `0%` gives them full attention. |
+| `generated_sparsity` | `trained` | Sparsity of the generated video's attention. `trained` uses the budget the selected predictor was trained at (T2VA 90%, R2VA 32 tiles) and the node reports which. `90%` skips 90% of the key tiles each query tile could attend; lower is closer to full attention and slower. A whole number such as `24` keeps exactly that many 128-token key tiles instead. |
+| `reference_sparsity` | `trained` | The same for references: first/last frames, guide frames, reference images and videos. `0%` gives them full attention. |
 | `full_attention_layers` | empty | 0-based DiT blocks that keep full attention, e.g. `0, 1, 47-49`. |
 | `full_attention_steps` | empty | 0-based sampling steps that keep full attention, e.g. `0`. |
 | `verbose` | off | Also report attention time per phase, call counts and predictor details on the node after each run. |
@@ -130,9 +146,10 @@ movement, not attention.
 
 ## Hardware
 
-One Triton kernel covers every NVIDIA GPU from SM80 on, Windows and Linux
-alike. Older cards, ROCm and CPU have no kernel: the node says so and the
-model runs its own attention.
+One Triton kernel covers every NVIDIA GPU from SM80 on and AMD RDNA3 /
+RDNA4 on ROCm, Windows and Linux alike. Older cards, other AMD GPUs and
+CPU have no kernel: the node stops with an error saying so; bypass it to
+render on those.
 
 | Hardware | Status |
 |---|---|
@@ -141,6 +158,8 @@ model runs its own attention.
 | B200 / B300 (sm100 / sm103) | code path ready, not yet verified on this hardware |
 | RTX 50, RTX PRO 6000 Blackwell (sm120) | **verified: RTX 5070, Windows 11** |
 | DGX Spark / GB10 (sm121) | code path ready, not yet verified on this hardware |
+| Radeon RX 9000 (RDNA4, gfx12), ROCm | verified: RX 9060 XT, Windows 11 |
+| Radeon RX 7000 (RDNA3, gfx11), ROCm | code path ready, not yet verified on this hardware |
 | Apple silicon (M series) | verified: M3 Pro, macOS 15 |
 
 Per-architecture notes and the full measurement log are in

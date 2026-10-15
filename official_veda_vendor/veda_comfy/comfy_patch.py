@@ -15,9 +15,21 @@ exactly that call through `transformer_options["optimized_attention_override"]`:
 
 The override is re-installed on every step (ON_PREPARE_STATE), like
 ComfyUI's own sparse attention node, so a node applied later cannot
-silently replace it. Node text: a few readable lines (kernel, video and
-plan, sparsity, share of full attention computed); `verbose` adds timing
-and call diagnostics.
+silently replace it. KJNodes' "MiniMax H3 Low VRAM Attention" splits each
+call into head groups (`minimax_head_chunks`), which would hand Veda a
+slice of heads it cannot map onto the predictor; Veda takes that split
+over instead (see `install`).
+
+Some nodes replace H3's whole attention forward with one that never calls
+`optimized_attention` (KJNodes' "MiniMax H3 Mem Eff Sage Attention
+Patch"), so the override would never run. When such a node comes before
+Veda, Veda routes that forward per block (`_routed_forward`): blocks Veda
+runs sparse take a forward that calls the override, the others keep the
+replacing node's forward. When it comes after Veda nothing can be routed;
+the node says so, and a run in which no H3 call reached Veda says so too.
+
+Node text: a few readable lines (kernel, video and plan, sparsity, share
+of full attention computed); `verbose` adds timing and call diagnostics.
 """
 
 from __future__ import annotations
@@ -25,6 +37,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import logging
+import re
 import weakref
 
 import torch
@@ -32,8 +45,10 @@ import torch
 import comfy.patcher_extension
 
 from . import backends
+from . import hardware
 from . import settings as veda_settings
 from . import status as veda_status
+from .backends import base as backends_base
 from .core import engine as veda_engine
 from .core import h3_layout
 from .core import plans as veda_plans
@@ -44,9 +59,158 @@ except ImportError:  # older ComfyUI: nothing to pause
     _pause_malloc_graph = contextlib.nullcontext
 
 _KEY = 'veda_sparse_attention'
+# KJNodes' "MiniMax H3 Low VRAM Attention" asks the H3 attention forward to
+# call attention once per head group; Veda moves the request to its own key
+# and splits only the calls it runs as full attention.
+_HEAD_CHUNKS = 'minimax_head_chunks'
+_HELD_HEAD_CHUNKS = 'veda_held_head_chunks'
+# KJNodes' convention: a forward that still calls `optimized_attention` is
+# marked with this attribute, and a node that installs one for sparse
+# attention to use leaves it under `sol_take_forward` (its Low VRAM node).
+# Why a call that reached the DiT block loop was still declined. Kept
+# apart from 'other attention' so they count towards the summary (they
+# did run, at full cost) and so a report says which one it was: the token
+# refiner also sees a layout that does not match its sequence, but it
+# never runs inside the block loop, so block_index tells them apart.
+_NO_LAYOUT = 'no H3 layout for this call'
+_WRONG_LAYOUT = 'layout from another pass'
+_MASKED = 'masked attention'
+_ODD_SHAPES = 'unexpected q / k / v shapes'
+_DECLINED = (_NO_LAYOUT, _WRONG_LAYOUT, _MASKED, _ODD_SHAPES)
+_COMPOSES = '_uses_optimized_attention'
+TAKE_FORWARD = 'sol_take_forward'
+_ATTN_FORWARD = re.compile(r'diffusion_model\.blocks\.(\d+)\.attn\.forward')
+# How much more padding than the plan's own grid is worth a word. The
+# reference is not zero: a searched geometry pads too (16:9 t72 pads 11%,
+# because the shapes it mixes do not all divide 24x42), and telling
+# someone to leave the size the predictor was built for would be bad
+# advice. Only a video that wastes materially more than that gets a line.
+_PADDING_HINT = 0.03
+# Display names of known forward replacements, by function name.
+_KNOWN_FORWARDS = {
+    'minimax_sageattn_forward':
+        '"MiniMax H3 Mem Eff Sage Attention Patch" (KJNodes)',
+}
 _TIMED_PHASES = (('gather', 'gather'), ('score', 'score'),
                  ('select', 'select'), ('attend', 'kernel'),
                  ('scatter', 'scatter'))
+
+
+def _by_head_groups(attend, q, chunks: int, skip_output_reshape: bool):
+    """Full attention in `chunks` head groups, split like KJNodes' Low VRAM
+    node so its peak-memory saving holds on the calls Veda declines.
+
+    Args:
+        attend: `attend(start, end)` runs heads [start, end) and returns
+            [B, S, h*D], or [B, h, S, D] with skip_output_reshape.
+        q: [B, H, S, D], for the shapes.
+        chunks: Number of head groups (> 1).
+        skip_output_reshape: The output layout attention was asked for.
+    """
+    batch, heads, seq_len, dim = q.shape
+    chunks = min(chunks, heads)
+    out = None
+    start = 0
+    for i in range(chunks):
+        end = start + heads // chunks + (1 if i < heads % chunks else 0)
+        part = attend(start, end)
+        if skip_output_reshape:
+            if out is None:
+                out = part.new_empty(batch, heads, seq_len, dim)
+            out[:, start:end] = part
+        else:
+            if out is None:
+                out = part.new_empty(batch, seq_len, heads * dim)
+            out[..., start * dim:end * dim] = part
+        del part
+        start = end
+    return out
+
+
+def replaced_forwards(model_patcher) -> dict[int, object]:
+    """H3 attention forwards patched in by other nodes that never call
+    `optimized_attention`, by block index."""
+    found = {}
+    patches = getattr(model_patcher, 'object_patches', None) or {}
+    for key, value in patches.items():
+        match = _ATTN_FORWARD.fullmatch(key)
+        if match and not getattr(value, _COMPOSES, False):
+            found[int(match.group(1))] = value
+    return found
+
+
+def describe_forward(forward) -> str:
+    """Who installed an attention forward, for the node text."""
+    name = getattr(forward, '__name__', type(forward).__name__)
+    known = _KNOWN_FORWARDS.get(name)
+    if known:
+        return known
+    module = getattr(forward, '__module__', None)
+    return f'{name} ({module})' if module else name
+
+
+def _comfyui_version() -> str:
+    try:
+        import comfyui_version  # pylint: disable=import-outside-toplevel
+        return comfyui_version.__version__
+    except Exception:  # very old ComfyUI, or not run from ComfyUI's root
+        return 'unknown'
+
+
+def context(info, *details: str) -> list[str]:
+    """The environment of an issue report on device `info`, then
+    `details` (what Veda was doing when it failed)."""
+    return [*hardware.environment(info),
+            f'ComfyUI: {_comfyui_version()}', *details]
+
+
+def kernel_error(resolution) -> veda_status.VedaError:
+    """The error for a device whose sparse kernel cannot run.
+
+    Three cases, told apart because each sends the user somewhere else:
+    the GPU is out of scope (nothing to fix, say what is supported); the
+    kernel is supported but a package is missing or the install is broken
+    in a way the backend recognises (say how to fix it); anything else is
+    ours to fix, so it comes with an issue report. Saying "no kernel works
+    on your GPU" for a failed build sends people looking for a hardware
+    problem they do not have.
+    """
+    label = resolution.device.label
+    if not resolution.has_candidate:
+        return veda_status.VedaError(veda_status.bilingual(
+            f'Veda cannot run on {label}: no sparse kernel covers this '
+            'device. Veda needs an NVIDIA GPU of SM80 (RTX 30 series) or '
+            'newer, an AMD RDNA3 / RDNA4 GPU (RX 7000 / 9000 series) on '
+            'ROCm, or Apple silicon. To render on this machine, bypass or '
+            'remove the Veda node.',
+            f'Veda 无法在 {label} 上运行：没有覆盖这个设备的稀疏 kernel。'
+            'Veda 需要 SM80（RTX 30 系）或更新的 NVIDIA 显卡、ROCm 上的 AMD '
+            'RDNA3 / RDNA4 显卡（RX 7000 / 9000 系），或者 Apple 芯片。要在'
+            '这台机器上出图，请绕过或删除 Veda 节点。'))
+    if isinstance(resolution.error, backends_base.MissingDependency):
+        return veda_status.VedaError(
+            f'Veda cannot start its sparse kernel on {label}.\n'
+            f'Veda 无法在 {label} 上启动稀疏 kernel。\n'
+            f'{resolution.error}')
+    if resolution.hints:
+        return veda_status.VedaError('\n'.join([
+            f'Veda cannot start its sparse kernel on {label}: '
+            f'{resolution.report()}',
+            f'Veda 无法在 {label} 上启动稀疏 kernel（原因见上）。解决办法：',
+            *resolution.hints]))
+    return veda_status.issue_report(
+        f'Veda cannot start its sparse kernel on {label}. The GPU is '
+        'supported; the kernel failed on this install.',
+        f'Veda 无法在 {label} 上启动稀疏 kernel。这张卡是支持的，是 kernel '
+        '在这台机器上出错了。',
+        context(resolution.device, f'Attempts: {resolution.report()}'),
+        resolution.error)
+
+
+def _is_oom(error: BaseException) -> bool:
+    # MPS reports running out of memory as a plain RuntimeError.
+    return (isinstance(error, torch.cuda.OutOfMemoryError)
+            or 'out of memory' in str(error).lower())
 
 
 def _is_interrupt(error: BaseException) -> bool:
@@ -62,7 +226,9 @@ class _Run:
         self.calls = collections.Counter()
         self.evaluations = 0          # model calls (layer 0 reached)
         self.video = None             # e.g. '1344x768 · 5.2 s'
-        self.failed = None            # error text if the sparse path failed
+        self.prepared = False         # sampling started (ON_PREPARE_STATE)
+        self.spec = None              # layout of this run's target span
+        self.plan = None              # the plan chosen for it
         self.announced: set = set()
 
 
@@ -75,10 +241,12 @@ class VedaPatch:
         self.settings = settings
         self.status = veda_status.NodeStatus(node_id)
         self.installed: set = set()
-        self._engines: dict[str, veda_engine.VedaEngine | None] = {}
+        self._engines: dict[str, veda_engine.VedaEngine] = {}
         self._timers: dict[str, veda_engine.PhaseTimer] = {}
         self._steps = weakref.WeakKeyDictionary()
         self.run = _Run()
+        # Display names of the forwards routed by `take_over_forwards`.
+        self.taken_over: list[str] = []
 
     @property
     def calls(self) -> collections.Counter:
@@ -86,29 +254,29 @@ class VedaPatch:
 
     # -- per device ------------------------------------------------------
 
-    def _engine(self, device: torch.device) -> veda_engine.VedaEngine | None:
+    def _engine(self, device: torch.device) -> veda_engine.VedaEngine:
+        """The engine for `device`.
+
+        Raises:
+            VedaError: If no sparse kernel runs there (see `kernel_error`).
+        """
         key = str(device)
         if key not in self._engines:
             resolution = backends.resolve(
                 device,
                 notify=self.status.show)
             if resolution.backend is None:
-                self.status.warn(
-                    f'Veda off: no sparse kernel works on '
-                    f'{resolution.device.label}; using full attention\n'
-                    f'{resolution.report()}')
-                self._engines[key] = None
-            else:
-                engine = veda_engine.VedaEngine(
-                    self.bundle, self.settings.generated,
-                    self.settings.reference, resolution.backend, device)
-                if self.settings.verbose:
-                    timer = engine.enable_timing()
-                    if timer is not None:
-                        self._timers[key] = timer
-                    logging.info('Veda: backends on %s: %s',
-                                 resolution.device.label, resolution.report())
-                self._engines[key] = engine
+                raise kernel_error(resolution)
+            engine = veda_engine.VedaEngine(
+                self.bundle, self.settings.generated,
+                self.settings.reference, resolution.backend, device)
+            if self.settings.verbose:
+                timer = engine.enable_timing()
+                if timer is not None:
+                    self._timers[key] = timer
+                logging.info('Veda: backends on %s: %s',
+                             resolution.device.label, resolution.report())
+            self._engines[key] = engine
         return self._engines[key]
 
     def _step(self, transformer_options) -> int | None:
@@ -137,22 +305,41 @@ class VedaPatch:
         def override(func, q, k, v, heads, mask=None, attn_precision=None,
                      skip_reshape=False, skip_output_reshape=False,
                      **kwargs):
+            options = kwargs.get('transformer_options') or {}
+
             def dense(reason: str):
                 patch.run.calls[reason] += 1
                 kw = dict(mask=mask, attn_precision=attn_precision,
                           skip_reshape=skip_reshape,
                           skip_output_reshape=skip_output_reshape, **kwargs)
-                if previous is None:
-                    return func(q, k, v, heads, **kw)
-                return previous(func, q, k, v, heads, **kw)
 
-            options = kwargs.get('transformer_options') or {}
+                def attend(q, k, v, heads):
+                    if previous is None:
+                        return func(q, k, v, heads, **kw)
+                    return previous(func, q, k, v, heads, **kw)
+
+                chunks = options.get(_HELD_HEAD_CHUNKS)
+                if reason == 'other attention' or not chunks:
+                    return attend(q, k, v, heads)
+                return _by_head_groups(
+                    lambda a, b: attend(q[:, a:b], k[:, a:b], v[:, a:b],
+                                        b - a),
+                    q, chunks, skip_output_reshape)
+
             layout = options.get('minimax_h3_layout')
-            if (mask is not None or not skip_reshape or q.dim() != 4
-                    or q.shape[0] != 1 or q.shape != k.shape
-                    or q.shape != v.shape or layout is None
-                    or getattr(layout, 'seq_len', None) != q.shape[2]):
-                return dense('other attention')
+            reason = None
+            if mask is not None:
+                reason = _MASKED
+            elif (not skip_reshape or q.dim() != 4 or q.shape[0] != 1
+                  or q.shape != k.shape or q.shape != v.shape):
+                reason = _ODD_SHAPES
+            elif layout is None:
+                reason = _NO_LAYOUT
+            elif getattr(layout, 'seq_len', None) != q.shape[2]:
+                reason = _WRONG_LAYOUT
+            if reason is not None:
+                return dense(reason if isinstance(options.get('block_index'),
+                                                  int) else 'other attention')
             if options.get('block_index') == 0:
                 patch.run.evaluations += 1
             reason = patch._dense_reason(q, options)
@@ -161,34 +348,24 @@ class VedaPatch:
             try:
                 with _pause_malloc_graph():
                     return patch._sparse(q, k, v, layout, options,
-                                         skip_output_reshape, dense)
-            except Exception as error:  # never lose the user's render
+                                         skip_output_reshape)
+            except veda_status.VedaError:
+                raise  # already says what happened and what to do
+            except Exception as error:  # stop, and say why
                 if _is_interrupt(error):
                     raise
-                patch.run.failed = f'{type(error).__name__}: {error}'
                 logging.error('Veda: sparse attention failed', exc_info=True)
-                patch.status.warn(
-                    'Veda hit an error and finishes this run with full '
-                    f'attention:\n{patch.run.failed}')
-                return dense('error')
+                raise patch._runtime_error(q, options, error) from error
 
         return override
 
-    def _dense_reason(self, q, options) -> str | None:
-        """Why this H3 call runs full attention, or None to go sparse."""
-        s, bundle = self.settings, self.bundle
-        if self.run.failed:
-            return 'error'
+    def _block_reason(self, options) -> str | None:
+        """Why this block runs full attention, from what is known before
+        q / k / v exist; None if it may go sparse."""
+        s = self.settings
         layer = options.get('block_index')
-        if not isinstance(layer, int) or layer >= bundle.num_layers:
+        if not isinstance(layer, int) or layer >= self.bundle.num_layers:
             return 'layer outside the predictor'
-        if q.shape[1] != bundle.num_heads or q.shape[3] != bundle.head_dim:
-            self._announce(('shape', tuple(q.shape)),
-                           f'Veda off: the model has {q.shape[1]} heads of '
-                           f'dim {q.shape[3]}, the predictor expects '
-                           f'{bundle.num_heads} x {bundle.head_dim}',
-                           warn=True)
-            return 'head mismatch'
         if layer in s.dense_layers:
             return 'full-attention layer'
         if s.dense_steps and self._step(options) in s.dense_steps:
@@ -197,7 +374,58 @@ class VedaPatch:
             return 'sparsity 0%'
         return None
 
-    def _sparse(self, q, k, v, layout, options, skip_output_reshape, dense):
+    def _dense_reason(self, q, options) -> str | None:
+        """Why this H3 call runs full attention, or None to go sparse."""
+        bundle = self.bundle
+        reason = self._block_reason(options)
+        if reason is not None:
+            return reason
+        if q.shape[1] != bundle.num_heads or q.shape[3] != bundle.head_dim:
+            raise veda_status.issue_report(
+                f'Veda stopped: an attention call has {q.shape[1]} heads of '
+                f'dim {q.shape[3]}, the predictor expects '
+                f'{bundle.num_heads} x {bundle.head_dim}. Another node may '
+                'split the heads; if removing the attention nodes around '
+                'Veda does not help, please report it.',
+                f'Veda 已停止：注意力调用有 {q.shape[1]} 个头（维度 '
+                f'{q.shape[3]}），打分器需要 {bundle.num_heads} x '
+                f'{bundle.head_dim}。可能有其他节点把头拆开了；去掉 Veda 前后'
+                '的注意力节点仍然出现的话，请提 issue。',
+                self._call_context(q, options))
+        return None
+
+    def _call_context(self, q, options, *details: str) -> list[str]:
+        """Issue-report context for one attention call."""
+        return context(
+            hardware.describe(q.device),
+            f'Call: block {options.get("block_index")}, '
+            f'step {self._step(options)}, q {tuple(q.shape)} {q.dtype}',
+            f'Settings: {self.settings.describe()}',
+            f'Predictor: {self.bundle.describe()}', *details)
+
+    def _runtime_error(self, q, options, error: BaseException) -> Exception:
+        """The error for an exception in the sparse path.
+
+        Out of memory stays a `torch.cuda.OutOfMemoryError`: ComfyUI's
+        executor unloads its models when it sees one, and the user's next
+        attempt needs that memory back.
+        """
+        if _is_oom(error):
+            return torch.cuda.OutOfMemoryError(veda_status.bilingual(
+                f'Veda ran out of GPU memory in its attention ({error}). '
+                'Lower the resolution or the number of frames, or start '
+                'ComfyUI with --reserve-vram 2 so that more memory stays '
+                'free for attention.',
+                'Veda 在注意力里显存不足（原因见上）。请降低分辨率或帧数，'
+                '或者用 --reserve-vram 2 启动 ComfyUI，给注意力留出更多显存。'))
+        engine = self._engines.get(str(q.device))
+        backend = engine.backend.display if engine else 'none'
+        return veda_status.issue_report(
+            'Veda stopped: its sparse attention failed.',
+            'Veda 已停止：稀疏注意力出错。',
+            self._call_context(q, options, f'Backend: {backend}'), error)
+
+    def _sparse(self, q, k, v, layout, options, skip_output_reshape):
         # ComfyUI records each block's allocations into a malloc graph
         # (comfy-aimdo) and expects everything allocated inside a block to
         # be gone by its end. Veda keeps device state across calls (tile
@@ -206,28 +434,62 @@ class VedaPatch:
         # paused, like ComfyUI's own sparse attention node does for its
         # persistent state. Otherwise the process aborts natively.
         engine = self._engine(q.device)
-        if engine is None:
-            return dense('no sparse kernel')
         try:
             spec = engine.layout_spec(layout)
         except h3_layout.LayoutError as error:
-            self._announce(('layout', str(error)),
-                           f'Veda off for this video: cannot read the H3 '
-                           f'layout ({error})', warn=True)
-            return dense('layout')
+            raise veda_status.issue_report(
+                f'Veda stopped: it cannot read the H3 layout of this video '
+                f'({error}).',
+                'Veda 已停止：读不懂这个视频的 H3 序列布局（原因见上）。',
+                self._call_context(q, options, f'Layout: {layout!r}'),
+                error) from error
         choice = engine.plan_for(spec)
         self.run.video = veda_plans.describe_grid(spec.target.grid)
+        self.run.spec, self.run.plan = spec, choice.plan
         self._announce(('plan', spec.target.grid),
                        self._running_text(engine, spec, choice),
                        warn=not choice.exact)
+        self._suggest_shape(spec.target.grid, choice)
         batch, heads, seq_len, dim = q.shape
         out = engine.attention(q[0].transpose(0, 1), k[0].transpose(0, 1),
                                v[0].transpose(0, 1), options['block_index'],
-                               spec, choice.plan)
+                               spec, choice.plan,
+                               head_chunks=options.get(_HELD_HEAD_CHUNKS, 1))
         self.run.calls['sparse'] += 1
         if skip_output_reshape:
             return out.transpose(0, 1).unsqueeze(0)
         return out.reshape(batch, seq_len, heads * dim)
+
+    def _suggest_shape(self, grid, choice) -> None:
+        """Says what to ask for when this video wastes tiles on padding.
+
+        A tile is computed whole, so padding is attention time spent on
+        rows that do not exist. The grid cannot be changed here - it
+        follows the width, height and length the H3 node was given - so
+        the node reports the nearest request that divides evenly.
+        """
+        padding = veda_plans.padding_fraction(choice.plan, grid)
+        baseline = veda_plans.padding_fraction(choice.plan, choice.plan.grid)
+        if padding <= baseline + _PADDING_HINT:
+            return
+        better = veda_plans.suggest_grid(choice.plan, grid)
+        if better == tuple(grid):
+            return
+        want = veda_plans.describe_request(better)
+        have = veda_plans.describe_request(grid)
+        self._announce(
+            ('padding', tuple(grid)),
+            f"{100 * padding:.0f}% of this video's tiles are padding, "
+            f'computed but empty, against {100 * baseline:.0f}% at the '
+            f'size this plan was built for. Ask for {want} '
+            f'({veda_plans.describe_latent(better)}) and this plan '
+            f'divides evenly; this run is {have} '
+            f'({veda_plans.describe_latent(grid)}).',
+            zh=f'这个视频有 {100 * padding:.0f}% 的 tile 是补齐出来的'
+               f'——照样要算，但里面没有内容（这套方案自己的尺寸是 '
+               f'{100 * baseline:.0f}%）。改成 {want}'
+               f'（{veda_plans.describe_latent(better)}）对这套方案正好整除；'
+               f'本次是 {have}（{veda_plans.describe_latent(grid)}）。')
 
     # -- node text ---------------------------------------------------------
 
@@ -252,16 +514,14 @@ class VedaPatch:
 
     def _summary(self) -> str | None:
         run = self.run
-        engines = [e for e in self._engines.values() if e is not None]
+        engines = list(self._engines.values())
         sparse = run.calls.get('sparse', 0)
         full = sum(n for r, n in run.calls.items()
                    if r not in ('sparse', 'other attention'))
         if not sparse and not full:
             return None
         backend = engines[0].backend.display if engines else 'full attention'
-        headline = ('Veda done' if sparse and not run.failed
-                    else 'Veda done, fell back to full attention')
-        lines = [f'{headline} · {backend}']
+        lines = [f'Veda done · {backend}']
         if run.video:
             lines.append(f'Video: {run.video}')
         work = [e.stats.compute_fraction() for e in engines]
@@ -275,14 +535,44 @@ class VedaPatch:
         configured = self.settings.describe_full_attention()
         if configured:
             lines.append(f'Full attention: {configured}')
-        if run.failed:
-            lines.append(f'Fell back to full attention after: {run.failed}')
+        declined = {r: n for r, n in run.calls.items() if r in _DECLINED}
+        if declined:
+            why = ', '.join(f'{r} ({n})' for r, n in sorted(declined.items()))
+            lines.append(
+                f'{sum(declined.values())} attention calls ran at full cost '
+                f'- {why}. Veda places its tiles from the layout this pass '
+                'reports, so a stage at another resolution, or a tiled '
+                'high-resolution stage, runs unaccelerated.')
         if self.settings.verbose:
             lines += self._diagnostics(engines)
         return '\n'.join(lines)
 
+    def _geometry_lines(self) -> list[str]:
+        """What this run's sequence looked like, in the units the plan
+        and the H3 nodes use."""
+        run = self.run
+        if run.spec is None or run.plan is None:
+            return []
+        grid = run.spec.target.grid
+        padding = veda_plans.padding_fraction(run.plan, grid)
+        baseline = veda_plans.padding_fraction(run.plan, run.plan.grid)
+        lines = [f'Geometry: {veda_plans.describe_request(grid)} · '
+                 f'{veda_plans.describe_latent(grid)}',
+                 f'Plan: {run.plan.name} searched on '
+                 f'{veda_plans.describe_latent(run.plan.grid)} · padding '
+                 f'{100 * padding:.1f}% (that plan\'s own grid '
+                 f'{100 * baseline:.1f}%)']
+        spans = [f'target {grid[0]}x{grid[1]}x{grid[2]}']
+        spans += [f'{s.kind} {s.grid[0]}x{s.grid[1]}x{s.grid[2]}'
+                  for s in run.spec.references]
+        lines.append(f'Sequence: {run.spec.seq_len} tokens · '
+                     + ', '.join(spans))
+        return lines
+
     def _diagnostics(self, engines) -> list[str]:
         run, lines = self.run, ['-- diagnostics --']
+        lines += self._geometry_lines()
+        lines.append(f'Selection: {self.settings.describe()}')
         for key, timer in self._timers.items():
             phases = timer.summary()
             total = sum(phases.values()) / 1000.0
@@ -297,10 +587,20 @@ class VedaPatch:
                 for name, label in _TIMED_PHASES))
             self._timers[key] = self._engines[key].enable_timing()
         for engine in engines:
+            lines.append(f'Backend: {engine.backend.display} on '
+                         f'{engine.device}')
             kept = engine.stats.kept_fraction()
             if kept is not None:
                 lines.append(f'Video tiles kept: {100 * kept:.1f}% of '
                              'video x video tile pairs')
+            spread = engine.stats.per_row()
+            if spread is not None:
+                low, mean, high = spread
+                lines.append(f'Key tiles per query tile: {low} min · '
+                             f'{mean:.1f} mean · {high} max'
+                             + ('  (a wide spread at a small count is what '
+                                'flickers)' if high - low > max(2, mean / 4)
+                                else ''))
             chunking = engine.chunking
             if chunking.get('chunks_per_layer'):
                 free = chunking.get('free_bytes')
@@ -308,6 +608,10 @@ class VedaPatch:
                     f'Chunks: {chunking["chunks_per_layer"]} per layer, '
                     f'{chunking["heads_per_chunk"]} heads each'
                     + (f' ({free / 2**30:.1f} GB free)' if free else ''))
+                workspace = chunking.get('workspace_bytes')
+                if workspace:
+                    lines.append('Attention workspace: '
+                                 f'{workspace / 2**20:.0f} MB at once')
         reasons = ', '.join(f'{r} {n}' for r, n in sorted(run.calls.items())
                             if r != 'sparse')
         lines.append(f'Attention calls: {run.calls.get("sparse", 0)} sparse'
@@ -315,17 +619,98 @@ class VedaPatch:
         lines.append(f'Predictor: {self.bundle.describe()}')
         return lines
 
-    def _announce(self, key, text: str, warn: bool = False) -> None:
+    def _announce(self, key, text: str, warn: bool = False,
+                  zh: str | None = None) -> None:
         if key in self.run.announced:
             return
         self.run.announced.add(key)
-        (self.status.warn if warn else self.status.show)(text)
+        if warn:
+            self.status.warn(text, zh=zh)
+        else:
+            self.status.show(text, zh=zh)
+
+    # -- other nodes' attention forwards ----------------------------------
+
+    def _routed_forward(self, attn, replaced):
+        """Block `attn`'s forward when another node replaced it with one that
+        bypasses the override: blocks Veda may run sparse take a forward
+        that calls the override, the rest keep `replaced`."""
+        patch = self
+        stock = type(attn).forward
+
+        def forward(x, rope_freqs=None, transformer_options={}):
+            options = (transformer_options
+                       if isinstance(transformer_options, dict) else {})
+            reason = patch._block_reason(options)
+            if reason is None:
+                own = options.get(TAKE_FORWARD)
+                if own is not None:  # KJNodes' Low VRAM forward
+                    return own(attn, x, rope_freqs=rope_freqs,
+                               transformer_options=transformer_options)
+                if isinstance(x, list):  # KJNodes' block patch hands [h]
+                    x = x.pop()
+                return stock(attn, x, rope_freqs=rope_freqs,
+                             transformer_options=transformer_options)
+            patch.run.calls[reason] += 1
+            if options.get('block_index') == 0:
+                patch.run.evaluations += 1
+            held = options.get(_HELD_HEAD_CHUNKS)
+            if held:  # the replacing forward reads the split itself
+                transformer_options = dict(transformer_options)
+                transformer_options[_HEAD_CHUNKS] = held
+            return replaced(x, rope_freqs=rope_freqs,
+                            transformer_options=transformer_options)
+
+        setattr(forward, _COMPOSES, True)
+        return forward
+
+    def take_over_forwards(self, model_patcher, diffusion) -> None:
+        """Routes the H3 attention forwards that bypass the override (see
+        `_routed_forward`) on `model_patcher`, a clone Veda owns."""
+        names = []
+        for index, replaced in sorted(replaced_forwards(model_patcher).items()):
+            if index >= len(diffusion.blocks):
+                continue
+            attn = diffusion.blocks[index].attn
+            model_patcher.add_object_patch(
+                f'diffusion_model.blocks.{index}.attn.forward',
+                self._routed_forward(attn, replaced))
+            name = describe_forward(replaced)
+            if name not in names:
+                names.append(name)
+        self.taken_over = names
 
     # -- lifecycle ---------------------------------------------------------
 
+    def on_prepare(self, model_patcher, model_options) -> None:
+        """Every sampling step: re-install, and catch nodes after Veda that
+        replace the H3 attention forward (Veda cannot route those)."""
+        self.run.prepared = True
+        self.install(model_options['transformer_options'])
+        later = replaced_forwards(model_patcher)
+        if later:
+            names = ', '.join(sorted({describe_forward(f)
+                                      for f in later.values()}))
+            raise veda_status.VedaError(veda_status.bilingual(
+                f'Veda cannot run: {names} replaces the MiniMax-H3 '
+                'attention after Veda. Move the Veda node after it (last '
+                'before the sampler).',
+                f'Veda 无法运行：{names} 在 Veda 之后替换了 MiniMax-H3 的'
+                '注意力。请把 Veda 节点移到它后面（采样器之前的最后一个）。'))
+
     def install(self, transformer_options: dict) -> None:
         """Puts the override on top of whatever override is on the hook;
-        idempotent once it is on top."""
+        idempotent once it is on top.
+
+        Also takes over a head-group split requested by KJNodes' Low VRAM
+        node: the H3 forward then hands Veda all heads at once, Veda's
+        sparse path splits into at least that many head chunks itself, and
+        declined calls are split here.
+        """
+        chunks = transformer_options.get(_HEAD_CHUNKS)
+        if isinstance(chunks, int) and chunks > 1:
+            transformer_options[_HELD_HEAD_CHUNKS] = chunks
+            transformer_options[_HEAD_CHUNKS] = 1
         current = transformer_options.get('optimized_attention_override')
         if current in self.installed:
             return
@@ -338,6 +723,14 @@ class VedaPatch:
         summary = self._summary()
         if summary:
             self.status.show(summary)
+        elif self.run.prepared and not self.run.calls:
+            self.status.warn(
+                'Veda did not run: no MiniMax-H3 attention call reached it '
+                'in this render. Another node probably replaces the H3 '
+                'attention; place Veda after it, last before the sampler.',
+                zh='Veda 未运行：这次渲染没有任何 MiniMax-H3 注意力调用到达 '
+                   'Veda。可能有其他节点替换了 H3 注意力；请把 Veda 放在它'
+                   '之后、采样器之前。')
         for engine in self._engines.values():
             if engine is not None:
                 engine.stats = veda_engine.Stats()
@@ -350,10 +743,12 @@ def apply(model, bundle, settings: veda_settings.VedaSettings,
     patch = VedaPatch(bundle, settings, node_id)
     patched = model.clone()
     patch.install(patched.model_options.setdefault('transformer_options', {}))
+    patch.take_over_forwards(patched,
+                             patched.get_model_object('diffusion_model'))
     patched.add_callback_with_key(
         comfy.patcher_extension.CallbacksMP.ON_PREPARE_STATE, _KEY,
-        lambda model_patcher, timestep, model_options: patch.install(
-            model_options['transformer_options']))
+        lambda model_patcher, timestep, model_options: patch.on_prepare(
+            model_patcher, model_options))
     patched.add_callback_with_key(
         comfy.patcher_extension.CallbacksMP.ON_CLEANUP, _KEY,
         lambda model_patcher: patch.on_cleanup())
