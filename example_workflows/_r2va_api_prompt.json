@@ -1,0 +1,370 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "4": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "6": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "119",
+        0
+      ],
+      "conditioning": [
+        "114",
+        0
+      ]
+    }
+  },
+  "9": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 945967344952729,
+      "control_after_generate": "randomize"
+    }
+  },
+  "10": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "9",
+        0
+      ],
+      "guider": [
+        "6",
+        0
+      ],
+      "sampler": [
+        "100",
+        0
+      ],
+      "sigmas": [
+        "101",
+        0
+      ],
+      "latent_image": [
+        "115",
+        0
+      ]
+    }
+  },
+  "11": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    }
+  },
+  "12": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "13": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "10",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ]
+    }
+  },
+  "14": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": [
+        "10",
+        0
+      ],
+      "vae": [
+        "12",
+        0
+      ]
+    }
+  },
+  "15": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "13",
+        0
+      ],
+      "audio": [
+        "14",
+        0
+      ],
+      "fps": 24,
+      "bit_depth": "auto",
+      "color_space": "sRGB",
+      "codec": "none"
+    }
+  },
+  "16": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "15",
+        0
+      ],
+      "filename_prefix": "BSAI_VedaSparse_R2VA",
+      "format": "auto",
+      "codec": "auto"
+    }
+  },
+  "22": {
+    "class_type": "BSAI_H3_PromptTemplate",
+    "inputs": {
+      "template_select": "画面特效与多视角 | VFX & Multi-View > 人物与空间关系特效 | Person-Space > 空间透视拉伸",
+      "user_customization": "",
+      "narration": "",
+      "bsai_tpl_ui": ""
+    }
+  },
+  "25": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "22",
+        0
+      ]
+    }
+  },
+  "101": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": [
+        "119",
+        0
+      ],
+      "scheduler": "beta",
+      "steps": 4,
+      "denoise": 1
+    }
+  },
+  "100": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "102": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "ComfyUI_00001_.png",
+      "upload": "image"
+    }
+  },
+  "103": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "ComfyUI_00001_.png",
+      "upload": "image"
+    }
+  },
+  "104": {
+    "class_type": "PrimitiveFloat",
+    "inputs": {
+      "value": 5
+    }
+  },
+  "106": {
+    "class_type": "ComfyMathExpression",
+    "inputs": {
+      "values.a": [
+        "104",
+        0
+      ],
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
+    }
+  },
+  "110": {
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "inputs": {
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ],
+      "audio_vae": [
+        "12",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "102",
+        0
+      ],
+      "ref_images.ref_image_1": [
+        "103",
+        0
+      ],
+      "ref_images.ref_image_2": [
+        "113",
+        0
+      ],
+      "prompt": [
+        "22",
+        0
+      ],
+      "width": [
+        "112",
+        0
+      ],
+      "height": [
+        "112",
+        1
+      ],
+      "length": [
+        "106",
+        1
+      ],
+      "ref_images.ref_image_3": [
+        "117",
+        0
+      ],
+      "ref_image_size": "match"
+    }
+  },
+  "111": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "clip": [
+        "4",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ],
+      "first_frame": [
+        "102",
+        0
+      ],
+      "last_frame": [
+        "103",
+        0
+      ],
+      "prompt": [
+        "22",
+        0
+      ],
+      "width": [
+        "112",
+        0
+      ],
+      "height": [
+        "112",
+        1
+      ],
+      "length": [
+        "106",
+        1
+      ]
+    }
+  },
+  "112": {
+    "class_type": "ResolutionSelector",
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 1,
+      "multiple": 32
+    }
+  },
+  "113": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "ComfyUI_00001_.png",
+      "upload": "image"
+    }
+  },
+  "114": {
+    "class_type": "easy ifElse",
+    "inputs": {
+      "on_true": [
+        "110",
+        0
+      ],
+      "on_false": [
+        "111",
+        0
+      ],
+      "boolean": [
+        "116",
+        0
+      ]
+    }
+  },
+  "115": {
+    "class_type": "easy ifElse",
+    "inputs": {
+      "on_true": [
+        "110",
+        1
+      ],
+      "on_false": [
+        "111",
+        1
+      ],
+      "boolean": [
+        "116",
+        0
+      ]
+    }
+  },
+  "116": {
+    "class_type": "PrimitiveBoolean",
+    "inputs": {
+      "value": true
+    }
+  },
+  "117": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "ComfyUI_00001_.png",
+      "upload": "image"
+    }
+  },
+  "118": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+      "strength_model": 1
+    }
+  },
+  "119": {
+    "class_type": "VedaSparseAttention",
+    "inputs": {
+      "model": [
+        "118",
+        0
+      ],
+      "predictor": "minimax_h3_r2va_veda_preview_fp8.safetensors",
+      "generated_sparsity": "90%",
+      "reference_sparsity": "90%",
+      "full_attention_layers": "",
+      "full_attention_steps": "",
+      "verbose": false
+    }
+  }
+}
